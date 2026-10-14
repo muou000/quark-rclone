@@ -1,0 +1,629 @@
+package lanzou
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/cookiejar"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/alist-org/alist/v3/drivers/base"
+	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/op"
+	"github.com/alist-org/alist/v3/pkg/utils"
+	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
+)
+
+var upClient *resty.Client
+var once sync.Once
+
+func (d *LanZou) doupload(callback base.ReqCallback, resp interface{}) ([]byte, error) {
+	return d.post(d.BaseUrl+"/doupload.php", func(req *resty.Request) {
+		req.SetQueryParams(map[string]string{
+			"uid": d.uid,
+			"vei": d.vei,
+		})
+		if callback != nil {
+			callback(req)
+		}
+	}, resp)
+}
+
+func (d *LanZou) get(url string, callback base.ReqCallback) ([]byte, error) {
+	return d.request(url, http.MethodGet, callback, false)
+}
+
+func (d *LanZou) post(url string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+	data, err := d._post(url, callback, resp, false)
+	if err == ErrCookieExpiration && d.IsAccount() {
+		if atomic.CompareAndSwapInt32(&d.flag, 0, 1) {
+			_, err2 := d.Login()
+			atomic.SwapInt32(&d.flag, 0)
+			if err2 != nil {
+				err = errors.Join(err, err2)
+				d.Status = err.Error()
+				op.MustSaveDriverStorage(d)
+				return data, err
+			}
+		}
+		for atomic.LoadInt32(&d.flag) != 0 {
+			runtime.Gosched()
+		}
+		return d._post(url, callback, resp, false)
+	}
+	return data, err
+}
+
+func (d *LanZou) _post(url string, callback base.ReqCallback, resp interface{}, up bool) ([]byte, error) {
+	data, err := d.request(url, http.MethodPost, func(req *resty.Request) {
+		req.AddRetryCondition(func(r *resty.Response, err error) bool {
+			if utils.Json.Get(r.Body(), "zt").ToInt() == 4 {
+				time.Sleep(time.Second)
+				return true
+			}
+			return false
+		})
+		if callback != nil {
+			callback(req)
+		}
+	}, up)
+	if err != nil {
+		return data, err
+	}
+	switch utils.Json.Get(data, "zt").ToInt() {
+	case 1, 2, 4:
+		if resp != nil {
+			// 返回类型不统一,忽略错误
+			utils.Json.Unmarshal(data, resp)
+		}
+		return data, nil
+	case 9: // 登录过期
+		return data, ErrCookieExpiration
+	default:
+		info := utils.Json.Get(data, "inf").ToString()
+		if info == "" {
+			info = utils.Json.Get(data, "info").ToString()
+		}
+		return data, errors.New(info)
+	}
+}
+
+func (d *LanZou) request(url string, method string, callback base.ReqCallback, up bool) ([]byte, error) {
+	var client *resty.Client
+	if up {
+		once.Do(func() {
+			upClient = base.NewRestyClient().SetTimeout(120 * time.Second)
+		})
+		client = upClient
+	} else {
+		d.clientOnce.Do(func() {
+			jar, _ := cookiejar.New(nil)
+			d.client = base.RestyClient.Clone().SetCookieJar(jar)
+		})
+		client = d.client
+	}
+
+	// acw_sc__v2 反爬挑战可能出现在任意页面/接口(分享页、iframe 页、ajaxm.php 等)。
+	// 挑战页内嵌 arg1,需据此算出 cookie 后用同一请求重试,故在最底层统一处理。
+	var acwScV2 string
+	var body []byte
+	for i := 0; i < 3; i++ {
+		req := client.R()
+		req.SetHeaders(map[string]string{
+			"Referer":    "https://pc.woozooo.com",
+			"User-Agent": d.UserAgent,
+		})
+		if d.Cookie != "" && strings.HasPrefix(url, strings.TrimRight(d.BaseUrl, "/")+"/") {
+			req.SetHeader("cookie", d.Cookie)
+		}
+		if acwScV2 != "" && client.GetClient().Jar == nil {
+			req.SetCookie(&http.Cookie{Name: "acw_sc__v2", Value: acwScV2})
+		}
+		if callback != nil {
+			callback(req)
+		}
+
+		res, err := req.Execute(method, url)
+		if err != nil {
+			return nil, err
+		}
+		body = res.Body()
+		log.Debugf("lanzou request: url=>%s ,stats=>%d ,body => %s\n", res.Request.URL, res.StatusCode(), res.String())
+
+		if findAcwScV2Reg.Match(body) {
+			vs, e := CalcAcwScV2(string(body))
+			if e != nil {
+				log.Errorf("lanzou: err => acw_sc__v2 validation error  ,data => %s\n", body)
+				return body, e
+			}
+			acwScV2 = vs
+			if jar := client.GetClient().Jar; jar != nil {
+				jar.SetCookies(res.Request.RawRequest.URL, []*http.Cookie{{
+					Name:  "acw_sc__v2",
+					Value: vs,
+					Path:  "/",
+				}})
+			}
+			continue
+		}
+		return body, nil
+	}
+	return body, errors.New("acw_sc__v2 validation error")
+}
+
+var loginURL = "https://up.woozooo.com/mlogin.php"
+
+func (d *LanZou) Login() ([]*http.Cookie, error) {
+	client := base.NewRestyClient().SetRedirectPolicy(resty.NoRedirectPolicy())
+	// 登录接口同样可能返回 acw_sc__v2 反爬挑战页,需算出 cookie 后重试
+	var acwScV2 string
+	var resp *resty.Response
+	var err error
+	for i := 0; i < 3; i++ {
+		req := client.R().SetFormData(map[string]string{
+			"task":         "3",
+			"uid":          d.Account,
+			"pwd":          d.Password,
+			"setSessionId": "",
+			"setSig":       "",
+			"setScene":     "",
+			"setTocen":     "",
+			"formhash":     "",
+		})
+		if d.UserAgent != "" {
+			req.SetHeader("User-Agent", d.UserAgent)
+		}
+		if acwScV2 != "" {
+			req.SetCookie(&http.Cookie{Name: "acw_sc__v2", Value: acwScV2})
+		}
+		resp, err = req.Post(loginURL)
+		if err != nil {
+			return nil, err
+		}
+		if findAcwScV2Reg.Match(resp.Body()) {
+			vs, e := CalcAcwScV2(resp.String())
+			if e != nil {
+				return nil, fmt.Errorf("login err: %w, data: %s", e, resp.Body())
+			}
+			acwScV2 = vs
+			continue
+		}
+		break
+	}
+	if utils.Json.Get(resp.Body(), "zt").ToInt() != 1 {
+		return nil, fmt.Errorf("login err: %s", resp.Body())
+	}
+	d.Cookie = CookieToString(resp.Cookies())
+	return resp.Cookies(), nil
+}
+
+/*
+通过cookie获取数据
+*/
+
+// 获取文件和文件夹,获取到的文件大小、更改时间不可信
+func (d *LanZou) GetAllFiles(folderID string) ([]model.Obj, error) {
+	folders, err := d.GetFolders(folderID)
+	if err != nil {
+		return nil, err
+	}
+	files, err := d.GetFiles(folderID)
+	if err != nil {
+		return nil, err
+	}
+	return append(
+		utils.MustSliceConvert(folders, func(folder FileOrFolder) model.Obj {
+			return &folder
+		}), utils.MustSliceConvert(files, func(file FileOrFolder) model.Obj {
+			return &file
+		})...,
+	), nil
+}
+
+// 通过ID获取文件夹
+func (d *LanZou) GetFolders(folderID string) ([]FileOrFolder, error) {
+	var resp RespText[[]FileOrFolder]
+	_, err := d.doupload(func(req *resty.Request) {
+		req.SetFormData(map[string]string{
+			"task":      "47",
+			"folder_id": folderID,
+		})
+	}, &resp)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Text, nil
+}
+
+// 通过ID获取文件
+func (d *LanZou) GetFiles(folderID string) ([]FileOrFolder, error) {
+	files := make([]FileOrFolder, 0)
+	for pg := 1; ; pg++ {
+		var resp RespText[[]FileOrFolder]
+		_, err := d.doupload(func(req *resty.Request) {
+			req.SetFormData(map[string]string{
+				"task":      "5",
+				"folder_id": folderID,
+				"pg":        strconv.Itoa(pg),
+			})
+		}, &resp)
+		if err != nil {
+			return nil, err
+		}
+		if len(resp.Text) == 0 {
+			break
+		}
+		files = append(files, resp.Text...)
+	}
+	return files, nil
+}
+
+// 通过ID获取文件夹分享地址
+func (d *LanZou) getFolderShareUrlByID(fileID string) (*FileShare, error) {
+	var resp RespInfo[FileShare]
+	_, err := d.doupload(func(req *resty.Request) {
+		req.SetFormData(map[string]string{
+			"task":    "18",
+			"file_id": fileID,
+		})
+	}, &resp)
+	if err != nil {
+		return nil, err
+	}
+	return &resp.Info, nil
+}
+
+// 通过ID获取文件分享地址
+func (d *LanZou) getFileShareUrlByID(fileID string) (*FileShare, error) {
+	var resp RespInfo[FileShare]
+	_, err := d.doupload(func(req *resty.Request) {
+		req.SetFormData(map[string]string{
+			"task":    "22",
+			"file_id": fileID,
+		})
+	}, &resp)
+	if err != nil {
+		return nil, err
+	}
+	return &resp.Info, nil
+}
+
+/*
+通过分享链接获取数据
+*/
+
+// 判断类容
+var isFileReg = regexp.MustCompile(`class="fileinfo"|id="file"|文件描述`)
+var isFolderReg = regexp.MustCompile(`id="infos"`)
+
+// 获取文件文件夹基础信息
+
+// 获取文件名称
+var nameFindReg = regexp.MustCompile(`<title>(.+?) - 蓝奏云</title>|id="filenajax">(.+?)</div>|var filename = '(.+?)';|<div style="font-size.+?>([^<>].+?)</div>|<div class="filethetext".+?>([^<>]+?)</div>`)
+
+// 获取文件大小
+var sizeFindReg = regexp.MustCompile(`(?i)大小\W*([0-9.]+\s*[bkm]+)`)
+
+// 获取文件时间
+var timeFindReg = regexp.MustCompile(`\d+\s*[秒天分小][钟时]?前|[昨前]天|\d{4}-\d{2}-\d{2}`)
+
+// 查找分享文件夹子文件夹ID和名称
+var findSubFolderReg = regexp.MustCompile(`(?i)(?:folderlink|mbxfolder).+href="/(.+?)"(?:.+filename")?>(.+?)<`)
+
+// 获取下载页面链接
+var findDownPageParamReg = regexp.MustCompile(`<iframe.*?src="(.+?)"`)
+
+// 获取下载接口及文件 ID。旧页面使用 ajaxm.php，新版密码文件页面使用
+// ajaxfile.php；地址也可能使用单/双引号或完整 URL。
+var findAjaxPathReg = regexp.MustCompile(`(?i)(/ajax(?:m|file)\.php\?file=(\d+)\b)`)
+var findFileIDVarReg = regexp.MustCompile(`(?i)\b(?:f_id|fid)\s*=\s*['"]?(\d+)['"]?\s*;`)
+
+func findFileID(data string) (string, bool) {
+	if matches := findAjaxPathReg.FindStringSubmatch(data); len(matches) == 3 {
+		return matches[2], true
+	}
+	if matches := findFileIDVarReg.FindStringSubmatch(data); len(matches) == 2 {
+		return matches[1], true
+	}
+	return "", false
+}
+
+func getAjaxmPath(data string) string {
+	if matches := findAjaxPathReg.FindStringSubmatch(data); len(matches) == 3 {
+		return matches[1]
+	}
+	if fileID, ok := findFileID(data); ok {
+		return "/ajaxm.php?file=" + fileID
+	}
+	return "/ajaxm.php"
+}
+
+// GET 页面并去除注释(acw_sc__v2 反爬挑战已在 request 层统一处理)
+func (d *LanZou) getHtml(url string, callback base.ReqCallback) (string, error) {
+	data, err := d.get(url, callback)
+	if err != nil {
+		return "", err
+	}
+	return RemoveNotes(string(data)), nil
+}
+
+// 获取分享链接主界面
+func (d *LanZou) getShareUrlHtml(shareID string) (string, error) {
+	htmlStr, err := d.getHtml(fmt.Sprint(d.ShareUrl, "/", shareID), nil)
+	if err != nil {
+		return "", err
+	}
+	if strings.Contains(htmlStr, "取消分享") {
+		return "", ErrFileShareCancel
+	}
+	if strings.Contains(htmlStr, "文件不存在") {
+		return "", ErrFileNotExist
+	}
+	return htmlStr, nil
+}
+
+// 通过分享链接获取文件或文件夹
+func (d *LanZou) GetFileOrFolderByShareUrl(shareID, pwd string) ([]model.Obj, error) {
+	pageData, err := d.getShareUrlHtml(shareID)
+	if err != nil {
+		return nil, err
+	}
+
+	if !isFileReg.MatchString(pageData) {
+		files, err := d.getFolderByShareUrl(pwd, pageData)
+		if err != nil {
+			return nil, err
+		}
+		return utils.MustSliceConvert(files, func(file FileOrFolderByShareUrl) model.Obj {
+			return &file
+		}), nil
+	} else {
+		file, err := d.getFilesByShareUrl(shareID, pwd, pageData)
+		if err != nil {
+			return nil, err
+		}
+		return []model.Obj{file}, nil
+	}
+}
+
+// 通过分享链接获取文件(下载链接也使用此方法)
+// FileOrFolderByShareUrl 包含 pwd 和 url 字段
+// 参考 https://github.com/zaxtyson/LanZouCloud-API/blob/ab2e9ec715d1919bf432210fc16b91c6775fbb99/lanzou/api/core.py#L440
+func (d *LanZou) GetFilesByShareUrl(shareID, pwd string) (file *FileOrFolderByShareUrl, err error) {
+	pageData, err := d.getShareUrlHtml(shareID)
+	if err != nil {
+		return nil, err
+	}
+	return d.getFilesByShareUrl(shareID, pwd, pageData)
+}
+
+func (d *LanZou) getFilesByShareUrl(shareID, pwd string, sharePageData string) (*FileOrFolderByShareUrl, error) {
+	var (
+		param       map[string]string
+		downloadUrl string
+		baseUrl     string
+		file        FileOrFolderByShareUrl
+	)
+
+	// 删除注释
+	sharePageData = RemoveNotes(sharePageData)
+	sharePageData = RemoveJSComment(sharePageData)
+
+	// 需要密码
+	if strings.Contains(sharePageData, "pwdload") || strings.Contains(sharePageData, "passwddiv") {
+		sharePageData, err := getJSFunctionByName(sharePageData, "down_p")
+		if err != nil {
+			return nil, err
+		}
+		param, err := htmlJsonToMap(sharePageData)
+		if err != nil {
+			return nil, err
+		}
+		param["p"] = pwd
+
+		var resp FileShareInfoAndUrlResp[string]
+		_, err = d.post(d.ShareUrl+getAjaxmPath(sharePageData), func(req *resty.Request) {
+			req.SetHeader("Accept", "application/json, text/javascript, */*; q=0.01")
+			req.SetHeader("Referer", strings.TrimRight(d.ShareUrl, "/")+"/"+shareID)
+			req.SetHeader("Origin", strings.TrimRight(d.ShareUrl, "/"))
+			req.SetHeader("X-Requested-With", "XMLHttpRequest")
+			req.SetHeader("Sec-Fetch-Dest", "empty")
+			req.SetHeader("Sec-Fetch-Mode", "cors")
+			req.SetHeader("Sec-Fetch-Site", "same-origin")
+			req.SetFormData(param)
+		}, &resp)
+		if err != nil {
+			return nil, err
+		}
+		file.NameAll = resp.Inf
+		file.Pwd = pwd
+		baseUrl = resp.GetBaseUrl()
+		downloadUrl = resp.GetDownloadUrl()
+	} else {
+		urlpaths := findDownPageParamReg.FindStringSubmatch(sharePageData)
+		if len(urlpaths) != 2 {
+			log.Errorf("lanzou: err => not find file page param ,data => %s\n", sharePageData)
+			return nil, fmt.Errorf("not find file page param")
+		}
+		nextPageData, err := d.getHtml(fmt.Sprint(d.ShareUrl, urlpaths[1]), nil)
+		if err != nil {
+			return nil, err
+		}
+		param, err = htmlJsonToMap(nextPageData)
+		if err != nil {
+			return nil, err
+		}
+
+		var resp FileShareInfoAndUrlResp[int]
+		_, err = d.post(d.ShareUrl+getAjaxmPath(nextPageData), func(req *resty.Request) { req.SetFormData(param) }, &resp)
+		if err != nil {
+			return nil, err
+		}
+		baseUrl = resp.GetBaseUrl()
+		downloadUrl = resp.GetDownloadUrl()
+
+		names := nameFindReg.FindStringSubmatch(sharePageData)
+		if len(names) > 1 {
+			for _, name := range names[1:] {
+				if name != "" {
+					file.NameAll = name
+					break
+				}
+			}
+		}
+	}
+
+	sizes := sizeFindReg.FindStringSubmatch(sharePageData)
+	if len(sizes) == 2 {
+		file.Size = sizes[1]
+	}
+	file.ID = shareID
+	file.Time = timeFindReg.FindString(sharePageData)
+
+	// 重定向获取真实链接
+	headers := map[string]string{
+		"accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+	}
+	res, err := base.NoRedirectClient.R().SetHeaders(headers).Get(downloadUrl)
+	if err != nil {
+		return nil, err
+	}
+
+	rPageData := res.String()
+	if findAcwScV2Reg.MatchString(rPageData) {
+		log.Debug("lanzou: detected acw_sc__v2 challenge, recalculating cookie")
+		acwScV2, err := CalcAcwScV2(rPageData)
+		if err != nil {
+			return nil, err
+		}
+		// retry with calculated cookie to bypass anti-crawler validation
+		res, err = base.NoRedirectClient.R().
+			SetHeaders(headers).
+			SetCookie(&http.Cookie{Name: "acw_sc__v2", Value: acwScV2}).
+			Get(downloadUrl)
+		if err != nil {
+			return nil, err
+		}
+		rPageData = res.String()
+	}
+
+	file.Url = res.Header().Get("location")
+
+	// 触发验证
+	if res.StatusCode() != 302 {
+		param, err = htmlJsonToMap(rPageData)
+		if err != nil {
+			return nil, err
+		}
+		param["el"] = "2"
+		time.Sleep(time.Second * 2)
+
+		// 通过验证获取直连
+		data, err := d.post(fmt.Sprint(baseUrl, "/ajax.php"), func(req *resty.Request) { req.SetFormData(param) }, nil)
+		if err != nil {
+			return nil, err
+		}
+		file.Url = utils.Json.Get(data, "url").ToString()
+	}
+	return &file, nil
+}
+
+// 通过分享链接获取文件夹
+// 似乎子目录和文件不会加密
+// 参考 https://github.com/zaxtyson/LanZouCloud-API/blob/ab2e9ec715d1919bf432210fc16b91c6775fbb99/lanzou/api/core.py#L1089
+func (d *LanZou) GetFolderByShareUrl(shareID, pwd string) ([]FileOrFolderByShareUrl, error) {
+	pageData, err := d.getShareUrlHtml(shareID)
+	if err != nil {
+		return nil, err
+	}
+	return d.getFolderByShareUrl(pwd, pageData)
+}
+
+func (d *LanZou) getFolderByShareUrl(pwd string, sharePageData string) ([]FileOrFolderByShareUrl, error) {
+	from, err := htmlJsonToMap(sharePageData)
+	if err != nil {
+		return nil, err
+	}
+
+	files := make([]FileOrFolderByShareUrl, 0)
+	// vip获取文件夹
+	floders := findSubFolderReg.FindAllStringSubmatch(sharePageData, -1)
+	for _, floder := range floders {
+		if len(floder) == 3 {
+			files = append(files, FileOrFolderByShareUrl{
+				// Pwd: pwd, // 子文件夹不加密
+				ID:       floder[1],
+				NameAll:  floder[2],
+				IsFloder: true,
+			})
+		}
+	}
+
+	// 获取文件
+	from["pwd"] = pwd
+	for page := 1; ; page++ {
+		from["pg"] = strconv.Itoa(page)
+		var resp FileOrFolderByShareUrlResp
+		_, err := d.post(d.ShareUrl+"/filemoreajax.php", func(req *resty.Request) { req.SetFormData(from) }, &resp)
+		if err != nil {
+			return nil, err
+		}
+		// 文件夹中的文件加密
+		for i := 0; i < len(resp.Text); i++ {
+			resp.Text[i].Pwd = pwd
+		}
+		if len(resp.Text) == 0 {
+			break
+		}
+		files = append(files, resp.Text...)
+		time.Sleep(time.Second)
+	}
+	return files, nil
+}
+
+// 通过下载头获取真实文件信息
+func (d *LanZou) getFileRealInfo(downURL string) (*int64, *time.Time) {
+	res, _ := base.RestyClient.R().Head(downURL)
+	if res == nil {
+		return nil, nil
+	}
+	time, _ := http.ParseTime(res.Header().Get("Last-Modified"))
+	size, _ := strconv.ParseInt(res.Header().Get("Content-Length"), 10, 64)
+	return &size, &time
+}
+
+func (d *LanZou) getVeiAndUid() (vei string, uid string, err error) {
+	// mydisk.php 同样可能返回 acw_sc__v2 反爬挑战页,需经 getHtml 处理后再解析
+	html, err := d.getHtml("https://pc.woozooo.com/mydisk.php", func(req *resty.Request) {
+		req.SetQueryParams(map[string]string{
+			"item":   "files",
+			"action": "index",
+		})
+	})
+	if err != nil {
+		return
+	}
+	// uid
+	uids := regexp.MustCompile(`uid=([^'"&;]+)`).FindStringSubmatch(html)
+	if len(uids) < 2 {
+		err = fmt.Errorf("uid variable not find")
+		return
+	}
+	uid = uids[1]
+
+	// vei
+	data, err := htmlJsonToMap(html)
+	if err != nil {
+		return
+	}
+	vei = data["vei"]
+
+	return
+}
