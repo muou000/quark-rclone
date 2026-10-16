@@ -1,0 +1,9 @@
+# Loopback WebDAV And Rclone Session Contract
+
+Quark adapter process binds a configured fixed port on `127.0.0.1` only. It exposes `/healthz`, `/capabilities`, and `/dav/`; health and capability responses contain no credentials. The WebDAV surface implements `OPTIONS`, `PROPFIND`, `GET`, `HEAD`, `PUT`, `MKCOL`, `MOVE`, `DELETE`, `LOCK`, and `UNLOCK`. `COPY`, `PROPPATCH`, and `POST` are explicitly unsupported for the mount client.
+
+rclone sends the Quark Cookie directly as a configured `Cookie` HTTP header to the loopback WebDAV endpoint. The adapter consumes that header as the session bootstrap and then uses its concurrency-safe session store for Quark API requests; refreshed `__puus`/`__pus` fields are reported to the supervisor for DPAPI persistence without requiring a restart for every refresh. The adapter rejects requests without the required Cookie and never binds a non-loopback interface.
+
+The adapter enforces in-memory WebDAV locks with `If` and `Lock-Token`, applies request cancellation and explicit read/write/upload timeouts, stops accepting new requests before shutdown, and drains in-flight requests before exiting. The supervisor generates a minimal `Temporary runtime configuration` containing the loopback URL, WebDAV root, and Cookie header in an ACL-restricted temporary directory; the Cookie never appears on the command line, and the file is deleted after rclone exits. Reauthentication regenerates the file and restarts the mount session.
+
+Choosing a fixed loopback port makes the endpoint predictable for the supervisor and diagnostics, while loopback-only binding and restrictive temporary-file permissions provide the security boundary. Direct Cookie forwarding avoids inventing a second Basic Auth credential, but makes temporary config handling and cleanup part of the mount safety contract.
