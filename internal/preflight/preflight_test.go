@@ -58,7 +58,7 @@ func TestRunUnverifiedPlatformStopsAtTheGate(t *testing.T) {
 func writeRcloneBundle(t *testing.T, content string, manifest map[string]string) string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, rcloneExeName), []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, RcloneExeName), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	SetRcloneManifest(manifest)
@@ -91,7 +91,7 @@ func TestCheckRcloneMissing(t *testing.T) {
 // binary is refused before it is ever executed.
 func TestCheckRcloneHashMismatchBlocks(t *testing.T) {
 	dir := writeRcloneBundle(t, "tampered bytes", map[string]string{
-		rcloneExeName: strings.Repeat("ab", 32),
+		RcloneExeName: strings.Repeat("ab", 32),
 	})
 	executed := false
 	check := CheckRclone(context.Background(), dir, func(ctx context.Context, exe string) (string, error) {
@@ -128,7 +128,7 @@ func TestCheckRcloneVersionMismatchBlocks(t *testing.T) {
 	content := "the real rclone bytes"
 	sum := sha256.Sum256([]byte(content))
 	dir := writeRcloneBundle(t, content, map[string]string{
-		rcloneExeName: hex.EncodeToString(sum[:]),
+		RcloneExeName: hex.EncodeToString(sum[:]),
 	})
 	check := CheckRclone(context.Background(), dir, fakeVersion("rclone v1.60.0"))
 	if check.OK {
@@ -145,7 +145,7 @@ func TestCheckRcloneHappyPath(t *testing.T) {
 	content := "the real rclone bytes"
 	sum := sha256.Sum256([]byte(content))
 	dir := writeRcloneBundle(t, content, map[string]string{
-		rcloneExeName: hex.EncodeToString(sum[:]),
+		RcloneExeName: hex.EncodeToString(sum[:]),
 	})
 	check := CheckRclone(context.Background(), dir, fakeVersion("rclone v1.71.2\n- os/version: Microsoft Windows 10"))
 	if !check.OK {
@@ -178,8 +178,8 @@ func TestClassifyMountFailurePinsTheThreeWaySplit(t *testing.T) {
 // report with rclone_invalid before the WinFsp gate runs.
 func TestRunBlocksOnRcloneGate(t *testing.T) {
 	report := Run(context.Background(), Options{
-		BundleDir:  t.TempDir(), // empty bundle: rclone missing
-		runVersion: fakeVersion(""),
+		BundleDir:    t.TempDir(), // empty bundle: rclone missing
+		VersionProbe: fakeVersion(""),
 	})
 	if report.Status != StatusRcloneInvalid {
 		t.Fatalf("status = %s, want rclone_invalid", report.Status)
@@ -200,11 +200,11 @@ func TestRunHappyPathWithoutSelfTest(t *testing.T) {
 	content := "the real rclone bytes"
 	sum := sha256.Sum256([]byte(content))
 	dir := writeRcloneBundle(t, content, map[string]string{
-		rcloneExeName: hex.EncodeToString(sum[:]),
+		RcloneExeName: hex.EncodeToString(sum[:]),
 	})
 	report := Run(context.Background(), Options{
-		BundleDir:  dir,
-		runVersion: fakeVersion("rclone v1.71.2"),
+		BundleDir:    dir,
+		VersionProbe: fakeVersion("rclone v1.71.2"),
 	})
 	switch report.Status {
 	case StatusOK:
@@ -225,13 +225,13 @@ func TestRunSelfTestFailureIsClassified(t *testing.T) {
 	content := "the real rclone bytes"
 	sum := sha256.Sum256([]byte(content))
 	dir := writeRcloneBundle(t, content, map[string]string{
-		rcloneExeName: hex.EncodeToString(sum[:]),
+		RcloneExeName: hex.EncodeToString(sum[:]),
 	})
 	// A host without WinFsp never reaches the self-test gate; accept that by
 	// asserting only when the chain got there.
 	report := Run(context.Background(), Options{
-		BundleDir:  dir,
-		runVersion: fakeVersion("rclone v1.71.2"),
+		BundleDir:    dir,
+		VersionProbe: fakeVersion("rclone v1.71.2"),
 		SelfTest: func(ctx context.Context) error {
 			return errors.New("mount: drive letter Q: is already in use")
 		},

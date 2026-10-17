@@ -19,17 +19,20 @@ import (
 	"strings"
 )
 
-// Status is the pre-check verdict, aligned with the ADR 0004 states the
-// tray maps repair actions onto.
+// Status is the pre-check verdict. Each value corresponds to the ADR 0004
+// state the tray maps a repair action onto: StatusWinFspRequired is
+// WinFspRequired, StatusDriveConflict is DriveConflict; the rclone and
+// unverified verdicts both present as WinFspRequired with their own finding.
 type Status string
 
 const (
 	// StatusOK means every gate passed.
 	StatusOK Status = "ok"
 	// StatusWinFspRequired means WinFsp is missing, mismatched, or the
-	// platform is outside the verified matrix.
+	// platform is outside the verified matrix (ADR 0004: WinFspRequired).
 	StatusWinFspRequired Status = "winfsp_required"
-	// StatusDriveConflict means the mount target letter is taken.
+	// StatusDriveConflict means the mount target letter is taken
+	// (ADR 0004: DriveConflict).
 	StatusDriveConflict Status = "drive_conflict"
 	// StatusRemoteError means the self-test failed on the far side — network
 	// or authentication — not on the local runtime.
@@ -37,8 +40,6 @@ const (
 	// StatusRcloneInvalid means the bundled rclone is missing, wrong, or
 	// fails its SHA-256 manifest; startup is blocked.
 	StatusRcloneInvalid Status = "rclone_invalid"
-	// StatusUnverified means the platform is not in the verified matrix.
-	StatusUnverified Status = "unverified"
 )
 
 // Finding is one check's outcome with the Chinese remedy a user can act on.
@@ -81,9 +82,9 @@ type Options struct {
 	// SelfTest, when non-nil, performs one real mount attempt; its error is
 	// classified into the mount finding. A nil self-test skips that gate.
 	SelfTest func(ctx context.Context) error
-	// runVersion probes the bundled rclone's version. Nil uses the real
-	// binary.
-	runVersion func(ctx context.Context, exe string) (string, error)
+	// VersionProbe overrides how the bundled rclone's version banner is
+	// obtained. Nil runs the real binary.
+	VersionProbe func(ctx context.Context, exe string) (string, error)
 }
 
 // platformVerified is the first-release compatibility matrix (ADR 0007):
@@ -96,8 +97,8 @@ func platformVerified(goos, goarch string) bool {
 // A failed gate stops nothing after it that is still safe to run, but the
 // report's Status carries the first blocking verdict and OK() is false.
 func Run(ctx context.Context, opts Options) *Report {
-	if opts.runVersion == nil {
-		opts.runVersion = runRcloneVersion
+	if opts.VersionProbe == nil {
+		opts.VersionProbe = runRcloneVersion
 	}
 	report := &Report{Verified: platformVerified(runtime.GOOS, runtime.GOARCH)}
 
@@ -125,7 +126,7 @@ func Run(ctx context.Context, opts Options) *Report {
 	}
 
 	// rclone gate: presence, SHA-256 manifest, declared version.
-	rcloneCheck := CheckRclone(ctx, bundleDir, opts.runVersion)
+	rcloneCheck := CheckRclone(ctx, bundleDir, opts.VersionProbe)
 	report.Findings = append(report.Findings, Finding{
 		Check: "rclone", OK: rcloneCheck.OK, Detail: rcloneCheck.Detail,
 	})
@@ -179,17 +180,22 @@ func DefaultBundleDir() string {
 
 // ClassifyMountFailure maps one real mount attempt's failure text onto the
 // state the tray can repair. The order matters: WinFsp wording wins because
-// a missing driver masks everything downstream, then the drive letter, and
-// anything left is the far side.
+// a missing driver masks everything downstream; explicit remote signals (an
+// HTTP status from the far side) come next, so a provider 403 is never
+// mistaken for a taken letter; then the drive-letter wording; and anything
+// left is the far side too.
 func ClassifyMountFailure(stderr string) Status {
 	lower := strings.ToLower(stderr)
 	switch {
 	case strings.Contains(lower, "winfsp"):
 		return StatusWinFspRequired
+	case strings.Contains(lower, "401"), strings.Contains(lower, "403"),
+		strings.Contains(lower, "forbidden"), strings.Contains(lower, "unauthorized"):
+		return StatusRemoteError
 	case strings.Contains(lower, "drive letter"),
 		strings.Contains(lower, "already in use"),
-		strings.Contains(lower, "access is denied"),
-		strings.Contains(lower, "cannot create a file when that file already exists"):
+		strings.Contains(lower, "cannot create a file when that file already exists"),
+		strings.Contains(lower, "access is denied"):
 		return StatusDriveConflict
 	default:
 		return StatusRemoteError

@@ -38,6 +38,18 @@ type WinFspCheck struct {
 	Detail     string
 }
 
+// winfspRebootPendingName marks an installer run that asked for a reboot
+// (ADR 0006: show a pending-reboot state, never restart automatically). It
+// lives in the bundle directory beside the installer.
+const winfspRebootPendingName = "winfsp-reboot-pending"
+
+// RebootPending reports whether a previous WinFsp install asked the user to
+// restart and the restart has not happened yet.
+func RebootPending(bundleDir string) bool {
+	_, err := os.Stat(filepath.Join(bundleDir, winfspRebootPendingName))
+	return err == nil
+}
+
 // CheckWinFsp verifies, in order: the registry install path, an
 // architecture-matching DLL, and the declared minimum version. Every failure
 // answers with the Chinese repair path; none of them upgrades anything.
@@ -61,10 +73,14 @@ func CheckWinFsp() WinFspCheck {
 				"WinFsp 版本 %s 低于应用要求的最低版本 %s：请升级 WinFsp x64（不要降级或替换系统驱动），完成后重新运行预检。",
 				dllVersion, MinWinFspVersion)}
 	}
+	detail := fmt.Sprintf("WinFsp 预检通过：%s（版本 %s，注册表路径 %s）。", dllPath, dllVersion, installDir)
+	if RebootPending(DefaultBundleDir()) {
+		detail += " 注意：上一次 WinFsp 安装要求重启计算机——请尽快重启后再挂载（本程序不会自动重启）。"
+	}
 	return WinFspCheck{
 		Installed: true, InstallDir: installDir, DLLPath: dllPath,
 		DLLVersion: dllVersion, OK: true,
-		Detail: fmt.Sprintf("WinFsp 预检通过：%s（版本 %s，注册表路径 %s）。", dllPath, dllVersion, installDir),
+		Detail: detail,
 	}
 }
 
@@ -128,43 +144,4 @@ func fileVersion(path string) (string, error) {
 		fixed.FileVersionMS&0xffff,
 		fixed.FileVersionLS>>16&0xffff,
 		fixed.FileVersionLS&0xffff), nil
-}
-
-// versionAtLeast compares dotted numeric versions: actual >= required.
-// Non-numeric tails are ignored; a required field the actual version lacks
-// counts as zero.
-func versionAtLeast(actual, required string) bool {
-	a, aok := parseVersion(actual)
-	r, rok := parseVersion(required)
-	if !aok || !rok {
-		return false
-	}
-	for i := 0; i < 2; i++ {
-		if a[i] != r[i] {
-			return a[i] > r[i]
-		}
-	}
-	return true
-}
-
-// parseVersion reads the first dotted numeric fields of a version string,
-// e.g. "2.1.25312" or "v2.0".
-func parseVersion(s string) ([2]int, bool) {
-	var out [2]int
-	s = strings.TrimPrefix(s, "v")
-	fields := strings.SplitN(s, ".", 3)
-	if len(fields) < 2 {
-		return out, false
-	}
-	for i := 0; i < 2; i++ {
-		n := 0
-		for _, ch := range fields[i] {
-			if ch < '0' || ch > '9' {
-				return out, false
-			}
-			n = n*10 + int(ch-'0')
-		}
-		out[i] = n
-	}
-	return out, true
 }

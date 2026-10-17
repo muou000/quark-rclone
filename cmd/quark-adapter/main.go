@@ -16,6 +16,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -244,7 +246,13 @@ func runDoctor(ctx context.Context, args []string) error {
 
 	var selfTestFn func(ctx context.Context) error
 	if *selfTest {
-		st, err := buildSelfTest(ctx, *bundleDir, *cookieFile, *useProfile, *profileDir, *port)
+		st, err := buildSelfTest(ctx, selfTestOpts{
+			bundleDir:  *bundleDir,
+			profileDir: *profileDir,
+			cookieFile: *cookieFile,
+			useProfile: *useProfile,
+			port:       *port,
+		})
 		if err != nil {
 			return err
 		}
@@ -269,90 +277,39 @@ func runDoctor(ctx context.Context, args []string) error {
 	return nil
 }
 
-// buildSelfTest assembles one real mount attempt for the pre-check's
-// self-test gate: a session on the loopback endpoint plus the bundled rclone
-// mounting the probe letter. Its error text is what the classifier reads.
-func buildSelfTest(ctx context.Context, bundleDir, cookieFile string, useProfile bool, profileDir string, port int) (func(context.Context) error, error) {
-	var cookie string
-	var persist func(string)
+// loadCredential resolves the session credential from the profile's DPAPI
+// store or a plain cookie file, returning the cookie, the matching rotation
+// sink, and — in profile mode — the loaded profile for the caller to update.
+// A profile load failure surfaces as "state: failed", the supervisor's
+// Failed answer (ADR 0005).
+func loadCredential(cookieFile string, useProfile bool, profileDir string) (cookie string, persist func(string), store *profile.Store, cfg profile.Config, outcome profile.Outcome, err error) {
 	switch {
 	case useProfile:
-		st, err := openProfileStore(profileDir)
-		if err != nil {
-			return nil, err
+		var st *profile.Store
+		if st, err = openProfileStore(profileDir); err != nil {
+			return
+		}
+		store = st
+		var loadErr error
+		if cfg, outcome, loadErr = st.LoadConfig(); loadErr != nil {
+			fmt.Fprintln(os.Stderr, "state: failed")
+			err = loadErr
+			return
 		}
 		if cookie, err = st.LoadCookie(); err != nil {
-			return nil, fmt.Errorf("load credential: %w (import -profile first)", err)
+			err = fmt.Errorf("load credential: %w (import -profile first)", err)
+			return
 		}
 		persist = profilePersist(st)
 	case cookieFile != "":
-		var err error
 		if cookie, err = readCookieFile(cookieFile); err != nil {
-			return nil, err
+			return
 		}
 		persist = writeCookieFilePersist(cookieFile)
 	default:
-		return nil, errors.New("-self-test requires -profile or -cookie-file")
+		err = errors.New("需要凭据来源：-profile 或 -cookie-file")
 	}
-
-	return func(testCtx context.Context) error {
-		sess, err := supervisor.Start(testCtx, supervisor.Config{Port: port, Cookie: cookie, Persist: persist})
-		if err != nil {
-			return err
-		}
-		defer sess.Stop()
-
-		rcloneExe := filepath.Join(bundleDir, "rclone.exe")
-		if _, err := os.Stat(rcloneExe); err != nil {
-			return fmt.Errorf("missing bundled rclone: %w", err)
-		}
-		// The probe letter is the profile's own preference, or Q: — a letter
-		// conflict here is part of what the self-test exists to classify.
-		probe := "Q:"
-		if st, err := openProfileStore(profileDir); err == nil {
-			if cfg, _, err := st.LoadConfig(); err == nil {
-				if mp := cfg.MountPoint(); mp != "" {
-					probe = mp
-				}
-			}
-		}
-		cmd := exec.Command(rcloneExe, "mount", "quark:", probe, "--config", sess.ConfigPath())
-		var stderr strings.Builder
-		cmd.Stderr = &stderr
-		if err := cmd.Start(); err != nil {
-			return err
-		}
-		done := make(chan error, 1)
-		go func() { done <- cmd.Wait() }()
-
-		// A mounted WebDAV drive is visible through the filesystem within a
-		// few seconds; a driver or letter problem shows up as an early exit.
-		deadline := time.Now().Add(30 * time.Second)
-		for {
-			if _, err := os.Stat(probe + `\`); err == nil {
-				_ = cmd.Process.Kill()
-				<-done
-				return nil
-			}
-			select {
-			case err := <-done:
-				if err != nil {
-					return errors.New(stderr.String())
-				}
-				return errors.New("rclone exited without mounting")
-			case <-testCtx.Done():
-				_ = cmd.Process.Kill()
-				return testCtx.Err()
-			default:
-			}
-			if time.Now().After(deadline) {
-				_ = cmd.Process.Kill()
-				<-done
-				return fmt.Errorf("mount did not appear within 30s: %s", stderr.String())
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-	}, nil
+	return
 }
 
 // runImport reads a candidate cookie from stdin, validates it, activates it
@@ -539,53 +496,25 @@ func runMount(ctx context.Context, args []string) error {
 	profileDir := fs.String("profile-dir", "", "override the profile directory (diagnostics)")
 	port := fs.Int("port", defaultLoopbackPort, "fixed loopback port")
 	rclone := fs.String("rclone", "", "path to the rclone binary; empty prints the mount command instead of running it")
+	rcloneSHA256 := fs.String("rclone-sha256", "", "explicit SHA-256 vouching for a non-bundled -rclone binary (required with -rclone)")
 	mountPoint := fs.String("mount-point", "", "drive letter or directory rclone mounts at")
 	bundleDir := fs.String("bundle-dir", "", "override the runtime bundle directory for the pre-check (default: <exe>\\bundle)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	var cookie string
-	var persist func(string)
-	var profileStore *profile.Store
-	var profileConfig profile.Config
-	switch {
-	case *useProfile:
-		st, err := openProfileStore(*profileDir)
-		if err != nil {
-			return err
-		}
-		profileStore = st
-		// A load failure here is the supervisor entering Failed (ADR 0005):
-		// the error already names the file and the remedy, and the original
-		// config is untouched on disk.
-		cfg, outcome, err := st.LoadConfig()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "state: failed")
-			return err
-		}
-		profileConfig = cfg
-		fmt.Fprintf(os.Stderr, "profile: %s (%s)\n", st.ConfigPath(), outcome)
-		var err2 error
-		cookie, err2 = st.LoadCookie()
-		if err2 != nil {
-			return fmt.Errorf("load credential: %w (import -profile first)", err2)
-		}
-		persist = profilePersist(st)
+	cookie, persist, profileStore, profileConfig, outcome, err := loadCredential(*cookieFile, *useProfile, *profileDir)
+	if err != nil {
+		return err
+	}
+	if *useProfile {
+		fmt.Fprintf(os.Stderr, "profile: %s (%s)\n", profileStore.ConfigPath(), outcome)
 		// Auto recovery (ADR 0005): an unset mount point falls back to the
 		// recorded preference — the explicit letter, or the last letter a
 		// session actually held.
 		if *mountPoint == "" {
-			*mountPoint = cfg.MountPoint()
+			*mountPoint = profileConfig.MountPoint()
 		}
-	case *cookieFile != "":
-		var err error
-		if cookie, err = readCookieFile(*cookieFile); err != nil {
-			return err
-		}
-		persist = writeCookieFilePersist(*cookieFile)
-	default:
-		return errors.New("mount requires -profile or -cookie-file")
 	}
 
 	// Issue #20: the runtime pre-check gates every mount. A bundled rclone
@@ -602,7 +531,23 @@ func runMount(ctx context.Context, args []string) error {
 		return errors.New(wc.Detail)
 	}
 	if *rclone != "" {
-		fmt.Fprintln(os.Stderr, "警告：-rclone 指定了非随包 rclone，该二进制未经 SHA-256 清单校验。")
+		// ADR 0006: the mount runs the bundled, manifest-verified rclone. An
+		// arbitrary binary is refused unless the caller explicitly vouches
+		// for its hash.
+		bundleRclone := filepath.Join(bundleDirForGate, preflight.RcloneExeName)
+		if filepath.Clean(*rclone) != filepath.Clean(bundleRclone) {
+			if *rcloneSHA256 == "" {
+				return fmt.Errorf("拒绝使用非随包 rclone %q：该二进制未经 SHA-256 校验。请省略 -rclone 使用随包组件，或用 -rclone-sha256 显式声明其 SHA-256。", *rclone)
+			}
+			sum, sumErr := fileSHA256Hex(*rclone)
+			if sumErr != nil {
+				return fmt.Errorf("无法计算 %s 的 SHA-256：%v", *rclone, sumErr)
+			}
+			if !strings.EqualFold(sum, *rcloneSHA256) {
+				return fmt.Errorf("%s 的 SHA-256 校验失败（实际 %s，声明 %s）：拒绝启动。", *rclone, sum, *rcloneSHA256)
+			}
+			fmt.Fprintln(os.Stderr, "警告：-rclone 指定了非随包 rclone，其哈希与 -rclone-sha256 声明一致；该组合未被发布流程验证。")
+		}
 	}
 
 	// Rotations during the session persist through the selected store: the
@@ -728,6 +673,16 @@ func readCookieFile(path string) (string, error) {
 		return "", fmt.Errorf("read cookie file: %w", err)
 	}
 	return strings.TrimSpace(string(cookie)), nil
+}
+
+// fileSHA256Hex hashes a file the way the -rclone-sha256 vouching compares.
+func fileSHA256Hex(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // wireService loads the cookie file and builds the adapter on top of a store
