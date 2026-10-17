@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>夸克网盘挂载 — 主面板</title>
+<style>
+  :root { --ok:#1a7f37; --warn:#b7791f; --bad:#c0392b; --muted:#6b7280; --line:#e5e7eb; }
+  * { box-sizing:border-box; }
+  body { font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif; margin:0; background:#f6f7f9; color:#1f2328; }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:10px 16px; display:flex; align-items:center; gap:12px; }
+  header h1 { font-size:16px; margin:0; }
+  #dot { width:12px; height:12px; border-radius:50%; background:var(--muted); }
+  nav { display:flex; gap:4px; margin-left:auto; }
+  nav button { border:1px solid var(--line); background:#fff; padding:6px 14px; cursor:pointer; font-size:14px; border-radius:6px; }
+  nav button.active { background:#1f6feb; color:#fff; border-color:#1f6feb; }
+  main { padding:16px; max-width:860px; margin:0 auto; }
+  section { display:none; }
+  section.active { display:block; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:12px; }
+  .card h2 { font-size:14px; margin:0 0 10px; color:var(--muted); font-weight:600; }
+  .state { font-size:24px; font-weight:700; }
+  .state.ok { color:var(--ok); } .state.warn { color:var(--warn); } .state.bad { color:var(--bad); }
+  .kv { display:grid; grid-template-columns:120px 1fr; gap:4px 12px; font-size:13px; margin-top:10px; }
+  .kv b { color:var(--muted); font-weight:500; }
+  .remedy { margin-top:10px; padding:8px 12px; border-radius:8px; font-size:13px; background:#fff8e6; border:1px solid #f0dfa8; }
+  .remedy.bad { background:#fdecea; border-color:#f5c6c0; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; }
+  .cap { display:inline-block; margin:2px 6px 2px 0; padding:3px 10px; border-radius:6px; font-size:12px; border:1px solid var(--line); }
+  .cap.no { background:#fdecea; border-color:#f5c6c0; color:var(--bad); }
+  .cap.yes { background:#e9f7ee; border-color:#bfe5cc; color:var(--ok); }
+  .notice { background:#eef2ff; border:1px solid #c7d2fe; border-radius:8px; padding:8px 12px; font-size:13px; margin:10px 0; }
+  pre.log { background:#0d1117; color:#c9d1d9; font-size:12px; padding:12px; border-radius:8px; max-height:280px; overflow:auto; white-space:pre-wrap; }
+  label { display:block; font-size:13px; margin:10px 0 4px; }
+  textarea, input, select { width:100%; padding:8px; border:1px solid var(--line); border-radius:6px; font-size:13px; font-family:inherit; }
+  textarea { height:90px; }
+  .row { display:flex; gap:10px; align-items:center; margin-top:8px; }
+  .row input[type=radio] { width:auto; }
+  button.primary { background:#1f6feb; color:#fff; border:none; padding:8px 18px; border-radius:6px; font-size:14px; cursor:pointer; }
+  button.ghost { background:#fff; border:1px solid var(--line); padding:8px 14px; border-radius:6px; font-size:13px; cursor:pointer; }
+  .msg { margin-top:10px; font-size:13px; }
+  .msg.err { color:var(--bad); } .msg.ok { color:var(--ok); }
+  .banner { background:#fdecea; border:1px solid #f5c6c0; border-radius:8px; padding:10px 14px; margin-bottom:12px; font-size:14px; }
+  .muted { color:var(--muted); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <span id="dot"></span>
+  <h1>夸克网盘挂载</h1>
+  <nav>
+    <button data-tab="status" class="active">状态</button>
+    <button data-tab="diag">诊断</button>
+    <button data-tab="setup">设置</button>
+  </nav>
+</header>
+<main>
+  <section id="tab-status" class="active">
+    <div class="card">
+      <div class="state" id="state-label">加载中…</div>
+      <div class="muted" id="state-since"></div>
+      <div class="remedy" id="state-remedy" style="display:none"></div>
+      <div class="kv">
+        <b>盘符</b><span id="mount-point">—</span>
+        <b>根目录</b><span id="root-path">—</span>
+        <b>阶段</b><span id="phase">—</span>
+        <b>下次重试</b><span id="next-retry">—</span>
+        <b>缓存目录</b><span id="cache-dir">—</span>
+      </div>
+      <div id="state-err" class="msg err"></div>
+    </div>
+    <div class="notice" id="unsupported-notice"></div>
+    <div class="card">
+      <h2>最近状态</h2>
+      <div class="muted" id="brief-log">—</div>
+    </div>
+  </section>
+
+  <section id="tab-diag">
+    <div class="card">
+      <h2>恢复时间线</h2>
+      <table><thead><tr><th>时间</th><th>状态</th><th>阶段</th><th>说明</th></tr></thead>
+      <tbody id="timeline"><tr><td colspan="4" class="muted">暂无记录</td></tr></tbody></table>
+    </div>
+    <div class="card">
+      <h2>能力矩阵（静态声明）</h2>
+      <div id="static-caps"></div>
+      <h2 style="margin-top:14px">能力探测</h2>
+      <table><thead><tr><th>探针</th><th>结果</th><th>时间</th><th>说明</th></tr></thead>
+      <tbody id="probes"></tbody></table>
+    </div>
+    <div class="card">
+      <h2>回写失败（dirty cache）</h2>
+      <div class="muted" style="margin-bottom:8px">失败文件保持可读可写，dirty cache 不会自动删除，恢复后自动重试。也可重启挂载立即触发重试。</div>
+      <div class="row" style="margin:0 0 8px">
+        <button class="ghost" id="btn-recheck">重启挂载以立即重试</button>
+        <span id="recheck-msg" class="msg"></span>
+      </div>
+      <table><thead><tr><th>文件</th><th>错误类别</th><th>性质</th><th>重试次数</th><th>下次重试</th></tr></thead>
+      <tbody id="writeback"><tr><td colspan="5" class="muted">无失败记录</td></tr></tbody></table>
+    </div>
+    <div class="card">
+      <h2>脱敏日志</h2>
+      <div class="row" style="margin:0 0 8px">
+        <a class="ghost" id="export-log" href="#" download>导出日志文件</a>
+        <span class="muted">日志已脱敏，可安全用于反馈问题。</span>
+      </div>
+      <pre class="log" id="log-view"></pre>
+    </div>
+  </section>
+
+  <section id="tab-setup">
+    <div class="banner" id="reauth-banner" style="display:none">
+      登录已失效：请在下方粘贴新的 Cookie 重新登录。根目录与盘符选择将保持不变；验证失败不会改动旧凭据。
+    </div>
+    <div class="card">
+      <h2 id="setup-title">首次配置 / 重新登录</h2>
+      <label for="cookie">粘贴浏览器导出的 Cookie</label>
+      <textarea id="cookie" placeholder="整行粘贴，包含 __puus 等字段；提交前会先验证"></textarea>
+      <div class="row">
+        <button class="primary" id="btn-validate">1. 验证并选择根目录</button>
+        <span class="muted">验证成功前不会保存任何内容</span>
+      </div>
+      <div id="validate-msg" class="msg"></div>
+
+      <div id="wizard-step2" style="display:none">
+        <label for="root-dir">选择挂载的根目录</label>
+        <select id="root-dir"></select>
+        <label>盘符</label>
+        <div class="row">
+          <input type="radio" name="drivemode" value="auto" checked><span>自动选择</span>
+          <input type="radio" name="drivemode" value="explicit"><span>指定盘符</span>
+          <input id="letter" placeholder="如 Q" maxlength="2" style="width:80px" disabled>
+        </div>
+        <div class="row">
+          <button class="primary" id="btn-apply">2. 应用并挂载</button>
+          <span class="muted">将验证通过的新凭据与选择写入配置并重启挂载</span>
+        </div>
+        <div id="apply-msg" class="msg"></div>
+      </div>
+    </div>
+  </section>
+</main>
+<script>
+const TOKEN = {{.}};
+const H = { "X-Panel-Token": TOKEN, "Content-Type": "application/json" };
+const $ = id => document.getElementById(id);
+const fmt = t => t ? new Date(t).toLocaleTimeString("zh-CN", {hour12:false}) : "—";
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("nav button").forEach(x => x.classList.remove("active"));
+  document.querySelectorAll("section").forEach(x => x.classList.remove("active"));
+  b.classList.add("active");
+  $("tab-" + b.dataset.tab).classList.add("active");
+});
+
+async function panel() {
+  try {
+    const r = await fetch("/api/panel", { headers: H });
+    render(await r.json());
+  } catch (e) { $("state-label").textContent = "面板不可用"; }
+}
+
+function render(d) {
+  const s = d.status;
+  $("state-label").textContent = s.label || "未运行";
+  $("state-label").className = "state " + (s.state === "Mounted" ? "ok" : s.permanent ? "bad" : "warn");
+  $("state-since").textContent = "自 " + fmt(s.since);
+  const rem = $("state-remedy");
+  rem.style.display = s.remedy ? "block" : "none";
+  rem.textContent = s.remedy || "";
+  rem.className = "remedy" + (s.permanent ? " bad" : "");
+  $("dot").style.background = s.state === "Mounted" ? "var(--ok)" : s.permanent ? "var(--bad)" : "var(--warn)";
+  $("mount-point").textContent = d.mount_point ? d.mount_point + ((d.opts && d.opts.letter) ? "" : "（自动）") : "（未挂载）";
+  $("root-path").textContent = s.root_path || "/";
+  $("phase").textContent = s.phase || "—";
+  $("next-retry").textContent = s.next_retry ? fmt(s.next_retry) : "—";
+  $("cache-dir").textContent = d.cache_dir || "—";
+  $("state-err").textContent = s.error || "";
+  $("unsupported-notice").textContent = d.unsupported || "";
+  $("brief-log").textContent = (d.log || []).slice(-3).map(e => fmt(e.at) + " " + e.text).join("\n") || "—";
+  $("reauth-banner").style.display = s.needs_reauth ? "block" : "none";
+
+  const tl = $("timeline"); tl.innerHTML = "";
+  (d.timeline || []).slice().reverse().forEach(h => {
+    tl.insertAdjacentHTML("beforeend", `<tr><td>${fmt(h.since)}</td><td>${esc(h.label)}</td><td>${esc(h.phase || "—")}</td><td>${esc(h.err || "—")}</td></tr>`);
+  });
+  if (!(d.timeline || []).length) tl.innerHTML = '<tr><td colspan="4" class="muted">暂无记录</td></tr>';
+
+  const sc = d.caps && d.caps.static || {};
+  const capNames = { list:"列举", read:"读取", write:"写入", mkdir:"建目录", move:"移动", rename:"重命名", delete:"删除", copy:"复制", overwrite_upload:"覆盖上传" };
+  $("static-caps").innerHTML = Object.entries(capNames).map(([k, n]) =>
+    `<span class="cap ${sc[k] ? "yes" : "no"}">${n}：${sc[k] ? "可用" : "不支持"}</span>`).join("");
+
+  const pb = $("probes"); pb.innerHTML = "";
+  const probeNames = { auth:"登录验证", root_list:"根目录列举", read_link:"读取链接", write:"写入诊断" };
+  (d.caps && d.caps.probes || []).forEach(p => {
+    const mark = p.skipped ? "跳过" : p.ok ? "通过" : "未通过";
+    pb.insertAdjacentHTML("beforeend", `<tr><td>${probeNames[p.name] || esc(p.name)}</td><td>${mark}</td><td>${fmt(p.at)}</td><td>${esc(p.error || "—")}</td></tr>`);
+  });
+
+  const wb = $("writeback"); wb.innerHTML = "";
+  (d.writeback || []).forEach(w => {
+    wb.insertAdjacentHTML("beforeend", `<tr><td>${esc(w.path)}</td><td>${esc(w.category_label)}</td><td>${w.permanent ? "需要处理" : "将自动重试"}</td><td>${w.retries}</td><td>${fmt(w.next_retry)}</td></tr>`);
+  });
+  if (!(d.writeback || []).length) wb.innerHTML = '<tr><td colspan="5" class="muted">无失败记录</td></tr>';
+
+  $("log-view").textContent = (d.log || []).map(e => fmt(e.at) + "  " + e.text).join("\n") || "（暂无日志）";
+  $("export-log").href = "/api/log?t=" + encodeURIComponent(TOKEN);
+
+  if (s.needs_reauth) { $("setup-title").textContent = "重新登录"; }
+  else if (!d.has_credential) { $("setup-title").textContent = "首次配置"; }
+  else { $("setup-title").textContent = "配置"; }
+}
+
+$("btn-validate").onclick = async () => {
+  const msg = $("validate-msg");
+  msg.className = "msg"; msg.textContent = "验证中…";
+  const r = await fetch("/api/validate", { method:"POST", headers:H, body: JSON.stringify({ cookie: $("cookie").value.trim() }) });
+  const j = await r.json();
+  if (!j.ok) { msg.className = "msg err"; msg.textContent = j.error || "验证失败"; return; }
+  msg.className = "msg ok"; msg.textContent = "验证通过，请选择根目录与盘符";
+  const sel = $("root-dir"); sel.innerHTML = "";
+  (j.dirs || []).forEach(d0 => {
+    const o = document.createElement("option");
+    o.value = d0.fid; o.textContent = d0.path; o.dataset.path = d0.path;
+    sel.appendChild(o);
+  });
+  if (!(j.dirs || []).length) {
+    const o = document.createElement("option");
+    o.value = "0"; o.textContent = j.list_error ? "（列举失败，使用根目录：" + j.list_error + "）" : "（根目录）";
+    sel.appendChild(o);
+  }
+  $("wizard-step2").style.display = "block";
+};
+
+document.querySelectorAll('input[name=drivemode]').forEach(r0 => r0.onchange = () => {
+  $("letter").disabled = document.querySelector('input[name=drivemode]:checked').value !== "explicit";
+});
+
+$("btn-apply").onclick = async () => {
+  const msg = $("apply-msg");
+  msg.className = "msg"; msg.textContent = "应用中…";
+  const explicit = document.querySelector('input[name=drivemode]:checked').value === "explicit";
+  const sel = $("root-dir");
+  const opt = sel.options[sel.selectedIndex] || {};
+  const body = {
+    cookie: $("cookie").value.trim(),
+    root_fid: opt.value || "0",
+    root_path: (opt.dataset && opt.dataset.path) || "/",
+    letter: explicit ? $("letter").value.trim() : ""
+  };
+  const r = await fetch("/api/apply", { method:"POST", headers:H, body: JSON.stringify(body) });
+  const j = await r.json();
+  if (!j.ok) { msg.className = "msg err"; msg.textContent = j.error || "应用失败"; return; }
+  msg.className = "msg ok"; msg.textContent = "已应用，挂载重启中…";
+  panel();
+};
+
+panel();
+setInterval(panel, 2000);
+
+$("btn-recheck").onclick = async () => {
+  const msg = $("recheck-msg");
+  msg.className = "msg"; msg.textContent = "重启中…";
+  try {
+    const r = await fetch("/api/recheck", { method:"POST", headers:H });
+    const j = await r.json();
+    if (!j.ok) { msg.className = "msg err"; msg.textContent = j.error || "重启失败"; return; }
+    msg.className = "msg ok"; msg.textContent = "挂载已重启";
+    panel();
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = "请求失败";
+  }
+};
+</script>
+</body>
+</html>

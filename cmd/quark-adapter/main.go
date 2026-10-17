@@ -34,6 +34,7 @@ import (
 	"github.com/muou000/quark-rclone/internal/adapter"
 	"github.com/muou000/quark-rclone/internal/dav"
 	"github.com/muou000/quark-rclone/internal/diag"
+	"github.com/muou000/quark-rclone/internal/mountapp"
 	"github.com/muou000/quark-rclone/internal/preflight"
 	"github.com/muou000/quark-rclone/internal/profile"
 	"github.com/muou000/quark-rclone/internal/quarkapi"
@@ -465,7 +466,7 @@ func runProbeWrite(ctx context.Context, args []string) error {
 		return err
 	}
 	rec := diag.NewRecorder()
-	rec.SetPersistPath(resolveDiagPath(*profileDir, *diagPath))
+	rec.SetPersistPath(mountapp.ResolveDiagPath(*profileDir, *diagPath))
 
 	fmt.Fprintln(os.Stderr, "写入诊断：将在网盘根目录上传并删除一个小文件（quark-write-probe-*.txt）")
 	rec.RunProbe(ctx, diag.ProbeWrite, func(ctx context.Context) error {
@@ -501,40 +502,6 @@ func runProbeWrite(ctx context.Context, args []string) error {
 		return errors.New("写入诊断未通过，详见上方快照")
 	}
 	return nil
-}
-
-// resolveCacheRoot resolves the VFS cache root: the profile's explicit
-// setting, else a directory beside the profile, else empty — the supervisor
-// then falls back to a per-user temp location. The per-instance directory
-// beneath the root is derived by the supervisor (issue #23).
-func resolveCacheRoot(profileStore *profile.Store, explicit string) string {
-	if explicit != "" {
-		return explicit
-	}
-	if profileStore != nil {
-		return filepath.Join(profileStore.Dir(), "cache")
-	}
-	return ""
-}
-
-// resolveDiagPath resolves the capability snapshot file: the explicit
-// override, or diag.json in the profile directory (the default profile dir
-// when none was named).
-func resolveDiagPath(profileDir, override string) string {
-	if override != "" {
-		return override
-	}
-	dir := profileDir
-	if dir == "" {
-		var err error
-		if dir, err = profile.DefaultDir(); err != nil {
-			// A resolvable default was already required by credential loading
-			// in every caller; a failure here leaves the recorder in memory
-			// only, which degrades diagnostics, not the mount.
-			return ""
-		}
-	}
-	return filepath.Join(dir, diag.SnapshotFile)
 }
 
 // diagProbeContent is the diagnostic file's whole content: self-describing and
@@ -675,65 +642,32 @@ func runMount(ctx context.Context, args []string) error {
 
 	// The supervised lifecycle (issue #21) owns everything from here: the
 	// adapter endpoint, the rclone child, the drive letter, restarts and the
-	// shutdown order. The CLI subscribes to the state stream and waits.
+	// shutdown order. The shared assembly (issue #24) wires the probes and the
+	// diagnostics recorder; the CLI subscribes to the state stream and waits.
 	statePath := *statePathFlag
 	if statePath == "" && profileStore != nil {
 		// Persist the lifecycle state beside the profile (ADR 0005).
 		statePath = filepath.Join(profileStore.Dir(), "state.json")
 	}
-	// Real readiness (ADR 0004): the provider's /config through the live
-	// credential, probed before rclone is ever asked to mount.
-	probeStore := session.NewStore(cookie, nil)
-	probeAPI := quarkapi.New(probeStore, quarkapi.Config{}, nil)
-
-	// Issue #22: the capability snapshot and the writeback ledger live beside
-	// the profile, so a later probe-write and the tray read the same truth the
-	// running mount wrote. The probes are the side-effect-free trio of ADR
-	// 0010 — auth, root list, read link — run after readiness succeeds; the
-	// write probe never runs here, it is manual only.
-	rec := diag.NewRecorder()
-	rec.SetPersistPath(resolveDiagPath(*profileDir, *diagPathFlag))
-	probeSvc := adapter.New(probeAPI, probeStore)
-	probeCaps := func(ctx context.Context) {
-		rec.RunProbe(ctx, diag.ProbeAuth, probeAPI.ProbeConfig)
-		files, listErr := probeSvc.List(ctx, quarkapi.RootFID)
-		rec.RunProbe(ctx, diag.ProbeRootList, func(context.Context) error { return listErr })
-		var linkTarget string
-		if listErr == nil {
-			for _, f := range files {
-				if !f.IsDir() {
-					linkTarget = f.FID
-					break
-				}
-			}
-		}
-		if linkTarget == "" {
-			// Nothing in the root to mint a read link against: skipped, not
-			// failed — the precondition was absent, not the capability.
-			rec.RunProbe(ctx, diag.ProbeReadLink, nil)
-			return
-		}
-		rec.RunProbe(ctx, diag.ProbeReadLink, func(ctx context.Context) error {
-			_, err := probeSvc.DownloadURL(ctx, linkTarget)
-			return err
-		})
+	cacheProfileDir := ""
+	if profileStore != nil {
+		cacheProfileDir = profileStore.Dir()
 	}
-	sup := supervisor.Supervise(ctx, supervisor.SupervisorConfig{
+	sup, rec := mountapp.Start(ctx, mountapp.Options{
 		Port:           *port,
 		Cookie:         cookie,
 		Persist:        persist,
 		RootFID:        profileConfig.Quark.RootFID,
-		BundleDir:      bundleDirForGate,
-		RclonePath:     *rclone,
 		MountPoint:     *mountPoint,
 		CacheMode:      profileConfig.Writes.CacheMode,
 		WriteBack:      profileConfig.Writes.WriteBack,
 		WriteChunkSize: profileConfig.Writes.WriteChunkSize,
-		CacheRoot:      resolveCacheRoot(profileStore, profileConfig.CacheDir),
+		CacheRoot:      mountapp.ResolveCacheRoot(cacheProfileDir, profileConfig.CacheDir),
+		RclonePath:     *rclone,
+		BundleDir:      bundleDirForGate,
 		StatePath:      statePath,
-		ReadyProbe:     probeAPI.ProbeConfig,
-		Recorder:       rec,
-		ProbeCaps:      probeCaps,
+		ProfileDir:     *profileDir,
+		DiagPath:       *diagPathFlag,
 	})
 	states := sup.Subscribe()
 	// The cache location is part of the write contract (issue #23): the user
