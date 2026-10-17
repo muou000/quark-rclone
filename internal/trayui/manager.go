@@ -176,6 +176,25 @@ func (m *Manager) CurrentRunnerMountPoint() string {
 	return m.runner.MountPoint()
 }
 
+// Configured reports whether a validated credential is in place — a restart
+// (recheck, upgrade) can run without the wizard.
+func (m *Manager) Configured() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.configured
+}
+
+// gate rejects mount-starting flows once the tray is on its way out (issue
+// #25, AC 3: 注销/关机后停止接受新的挂载请求). Stopped is one-way.
+func (m *Manager) gate() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopped {
+		return errors.New("托盘正在停止，不再接受新的挂载请求")
+	}
+	return nil
+}
+
 // Start brings up the mount with the credential the profile already holds.
 // An empty cookie starts nothing: the Disabled status is pushed so the tray
 // reflects the true state, and the wizard takes over.
@@ -187,6 +206,9 @@ func (m *Manager) Start(ctx context.Context, cookie string) error {
 		default:
 		}
 		return nil
+	}
+	if err := m.gate(); err != nil {
+		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -249,6 +271,9 @@ func (m *Manager) Apply(ctx context.Context, candidate string, in MountOptions) 
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
 
+	if err := m.gate(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(candidate) == "" {
 		return errors.New("请先粘贴 Cookie")
 	}
@@ -304,6 +329,9 @@ func (m *Manager) Recheck(ctx context.Context) error {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
 
+	if err := m.gate(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	cookie := m.cookie
 	m.mu.Unlock()

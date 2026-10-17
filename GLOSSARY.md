@@ -137,3 +137,7 @@ _Avoid_: event log, history list, audit trail
 **Panel token**:
 The per-process random value every state-changing panel request must present, isolating the mount from other local processes.
 _Avoid_: password, session id, API key
+
+**Single-instance guard**:
+The per-session named mutex that stops a second tray instance of any version from starting, so one drive letter and one cache directory never have two owners.
+_Avoid_: lock file, watchdog, duplicate check

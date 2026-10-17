@@ -30,14 +30,18 @@ import (
 	"fyne.io/systray"
 
 	"github.com/muou000/quark-rclone/internal/adapter"
+	"github.com/muou000/quark-rclone/internal/autostart"
 	"github.com/muou000/quark-rclone/internal/diag"
 	"github.com/muou000/quark-rclone/internal/mountapp"
+	"github.com/muou000/quark-rclone/internal/power"
 	"github.com/muou000/quark-rclone/internal/preflight"
 	"github.com/muou000/quark-rclone/internal/profile"
 	"github.com/muou000/quark-rclone/internal/quarkapi"
 	"github.com/muou000/quark-rclone/internal/session"
+	"github.com/muou000/quark-rclone/internal/singleinstance"
 	"github.com/muou000/quark-rclone/internal/supervisor"
 	"github.com/muou000/quark-rclone/internal/trayui"
+	"github.com/muou000/quark-rclone/internal/upgrade"
 )
 
 func main() {
@@ -59,6 +63,18 @@ func run() error {
 	if !*useProfile {
 		return errors.New("托盘需要 profile 模式（-profile）：重新登录必须能持久化新凭据")
 	}
+
+	// The single-instance guard (issue #25, AC 5): two tray instances of any
+	// version must never hold the same drive letter or cache directory. The
+	// guard is released at exit; a second launch exits here with a remedy.
+	releaseGuard, alreadyRunning, err := singleinstance.Acquire(singleinstance.DefaultName)
+	if err != nil {
+		return err
+	}
+	if alreadyRunning {
+		return errors.New("夸克网盘挂载已在运行：请从托盘图标操作，勿重复启动")
+	}
+	defer releaseGuard()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -107,13 +123,101 @@ func run() error {
 		return fmt.Errorf("主面板监听失败：%w", err)
 	}
 	panelURL := "http://" + listener.Addr().String() + "/?t=" + token
-	srv := &http.Server{Handler: trayui.NewServer(manager, token).Handler()}
+	upgRoot, err := appRoot()
+	if err != nil {
+		return err
+	}
+	upg := upgrade.New(upgRoot, upgrade.VerifyWithPreflight)
+	srv := &http.Server{Handler: trayui.NewServer(manager, token).
+		WithHooks(trayui.Hooks{
+			AutostartEnabled: func() bool {
+				v, _ := (autostart.Store{}).Get()
+				return v != ""
+			},
+			Autostart: func(enabled bool) error { return setAutostart(enabled) },
+			StagedVersion: func() string {
+				v, _ := upg.StagedVersion()
+				return v
+			},
+			Upgrade: func(ctx context.Context) error { return applyUpgrade(ctx, manager, upg, log) },
+		}).Handler()}
 	go func() { _ = srv.Serve(listener) }()
 	log.Add("主面板就绪：%s", panelURL)
+
+	// System lifecycle events (issue #25): a resume re-runs the mount's whole
+	// check chain, and a logoff/shutdown gets the orderly teardown before the
+	// session dies.
+	stopPower, err := power.Start(func(ev power.Event) {
+		switch ev {
+		case power.EventResume:
+			log.Add("系统已唤醒，重新执行挂载检查")
+			if err := manager.Recheck(ctx); err != nil {
+				log.Add("唤醒后重新挂载未完成：%v", err)
+			}
+		case power.EventSessionEnd:
+			log.Add("系统正在注销或关机，停止挂载")
+			manager.Stop()
+			systray.Quit()
+		}
+	})
+	if err != nil {
+		log.Add("电源事件监听不可用：%v", err)
+	} else {
+		defer stopPower()
+	}
 
 	go watchMount(ctx, manager, store, panelURL)
 
 	systray.Run(func() { onReady(ctx, manager, panelURL) }, func() { onExit(ctx, cancel, manager, srv) })
+	return nil
+}
+
+// appRoot is the application root the upgrade staging lives under: the
+// directory of the running executable (ADR 0006). A per-user install keeps
+// it writable without elevation.
+func appRoot() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("定位应用根目录失败：%w", err)
+	}
+	return filepath.Dir(exe), nil
+}
+
+// setAutostart toggles the current-user Run entry; the command always points
+// at the tray in profile mode.
+func setAutostart(enabled bool) error {
+	store := autostart.Store{}
+	if !enabled {
+		return store.Remove()
+	}
+	cmd, err := autostart.TrayCommand()
+	if err != nil {
+		return err
+	}
+	return store.Set(cmd)
+}
+
+// applyUpgrade runs the ADR 0006 sequence: stop the mount and wait for the
+// letter, swap the staged payload (with rollback on self-check failure), then
+// restart the mount on the new bundle if a credential is configured.
+func applyUpgrade(ctx context.Context, manager *trayui.Manager, upg *upgrade.Manager, log *trayui.EventLog) error {
+	log.Add("升级：停止挂载并等待盘符释放")
+	manager.Stop()
+	if err := upg.Activate(ctx); err != nil {
+		log.Add("升级失败，已回滚：%v", err)
+		if rerr := manager.Recheck(ctx); rerr != nil {
+			log.Add("回滚后重新挂载未完成：%v", rerr)
+		}
+		return err
+	}
+	log.Add("升级完成")
+	if !manager.Configured() {
+		return nil
+	}
+	if err := manager.Recheck(ctx); err != nil {
+		log.Add("升级后重新挂载未完成：%v", err)
+		return fmt.Errorf("升级完成，但重新挂载未成功：%w", err)
+	}
 	return nil
 }
 
