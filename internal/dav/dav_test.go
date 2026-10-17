@@ -3,6 +3,7 @@ package dav
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/muou000/quark-rclone/internal/adapter"
+	"github.com/muou000/quark-rclone/internal/diag"
 	"github.com/muou000/quark-rclone/internal/quarkapi"
 	"github.com/muou000/quark-rclone/internal/session"
 )
@@ -645,10 +647,12 @@ func TestPutBodyReceiveTimeout(t *testing.T) {
 
 // TestPutNameConflictSurfacesConflict pins the no-overwrite contract at the
 // DAV boundary: the provider's same-name refusal becomes 409, not the webdav
-// handler's generic 405.
+// handler's generic 405 — and the existing object survives untouched (issue
+// #22: no deletion of the old file).
 func TestPutNameConflictSurfacesConflict(t *testing.T) {
 	f := newFakeDrive(t)
 	s := f.startServer(t, nil)
+	f.add(quarkapi.RootFID, "f-existing", "existing.txt", quarkapi.KindFile, 3)
 	f.mu.Lock()
 	f.preResponses = []string{`{"status":400,"code":40001,"message":"file is doloading[` + "\u540c\u540d\u51b2\u7a81" + `]"}`}
 	f.mu.Unlock()
@@ -656,6 +660,25 @@ func TestPutNameConflictSurfacesConflict(t *testing.T) {
 	resp, body := davReq(t, "PUT", s.url(t, "/existing.txt"), "hello", nil)
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("status = %d body = %q, want 409", resp.StatusCode, body)
+	}
+
+	// The old file is still there with its old size, and the refused upload
+	// leaked no object into the drive.
+	resp, body = davReq(t, "PROPFIND", s.url(t, "/"), "", map[string]string{"Depth": "1"})
+	if resp.StatusCode != http.StatusMultiStatus ||
+		!strings.Contains(body, "existing.txt") ||
+		!strings.Contains(body, "<D:getcontentlength>3</D:getcontentlength>") {
+		t.Fatalf("old file did not survive the refused overwrite: %d %s", resp.StatusCode, body)
+	}
+	f.mu.Lock()
+	_, oldAlive := f.parent["f-existing"]
+	_, leaked := f.parent["uploaded-fid"]
+	f.mu.Unlock()
+	if !oldAlive {
+		t.Fatal("the fake drive lost the existing file")
+	}
+	if leaked {
+		t.Fatal("the refused upload leaked an object into the drive")
 	}
 }
 
@@ -941,5 +964,180 @@ func TestOpsTimeoutBoundsListing(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusNotFound && !strings.Contains(body, "not_found") {
 		t.Fatalf("status = %d body = %q", resp.StatusCode, body)
+	}
+}
+
+// TestErrorClassHeaderOnStableErrors pins the issue-22 header contract: every
+// error this endpoint authors carries the stable category in
+// X-Quark-Error-Class, so a mount client and a diagnostician read the same
+// truth the body states. COPY and PROPPATCH are the ADR 0010 anchor cases.
+func TestErrorClassHeaderOnStableErrors(t *testing.T) {
+	f := newFakeDrive(t)
+	s := f.startServer(t, nil)
+
+	for _, method := range []string{"COPY", "PROPPATCH"} {
+		resp, body := davReq(t, method, s.url(t, "/a.txt"), "", map[string]string{"Destination": "/b.txt"})
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("%s status = %d body = %q", method, resp.StatusCode, body)
+		}
+		if got := resp.Header.Get("X-Quark-Error-Class"); got != "operation_not_supported" {
+			t.Fatalf("%s X-Quark-Error-Class = %q, want operation_not_supported", method, got)
+		}
+		if !strings.Contains(body, "operation_not_supported") {
+			t.Fatalf("%s body = %q, want the category", method, body)
+		}
+	}
+
+	// The cookie gate's 401 is a stable error too.
+	req, err := http.NewRequest("PROPFIND", s.url(t, "/"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no-cookie status = %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Quark-Error-Class"); got != "auth_required" {
+		t.Fatalf("no-cookie X-Quark-Error-Class = %q, want auth_required", got)
+	}
+}
+
+// TestPutErrorsCarryClassHeader checks the PUT status rewriter carries the
+// category header through: 409 target_conflict and 502 upstream_transient.
+func TestPutErrorsCarryClassHeader(t *testing.T) {
+	f := newFakeDrive(t)
+	s := f.startServer(t, nil)
+	f.mu.Lock()
+	f.preResponses = []string{`{"status":400,"code":40001,"message":"file is doloading[` + "\u540c\u540d\u51b2\u7a81" + `]"}`}
+	f.mu.Unlock()
+	resp, _ := davReq(t, "PUT", s.url(t, "/existing.txt"), "hello", nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("conflict status = %d, want 409", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Quark-Error-Class"); got != "target_conflict" {
+		t.Fatalf("conflict X-Quark-Error-Class = %q, want target_conflict", got)
+	}
+
+	f.mu.Lock()
+	f.preResponses = []string{`{"status":500,"code":500,"message":"internal error"}`}
+	f.preStatuses = []int{http.StatusInternalServerError}
+	f.mu.Unlock()
+	resp, _ = davReq(t, "PUT", s.url(t, "/new.txt"), "hello", nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("transient status = %d, want 502", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Quark-Error-Class"); got != "upstream_transient" {
+		t.Fatalf("transient X-Quark-Error-Class = %q, want upstream_transient", got)
+	}
+}
+
+// TestWritebackLedgerRecordsAndResolves is the dirty-cache contract end to
+// end (issue #22): a refused upload lands in the ledger with its path and
+// retry count, the next success clears it, and another path's success does
+// not.
+func TestWritebackLedgerRecordsAndResolves(t *testing.T) {
+	f := newFakeDrive(t)
+	rec := diag.NewRecorder()
+	s := f.startServer(t, func(c *Config) { c.Recorder = rec })
+
+	f.mu.Lock()
+	f.preResponses = []string{`{"status":500,"code":500,"message":"internal error"}`}
+	f.preStatuses = []int{http.StatusInternalServerError}
+	f.mu.Unlock()
+	resp, _ := davReq(t, "PUT", s.url(t, "/stuck.bin"), "hello", nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("failing put status = %d, want 502", resp.StatusCode)
+	}
+	snap := rec.Snapshot()
+	if len(snap.Writeback) != 1 {
+		t.Fatalf("writeback = %d entries, want 1", len(snap.Writeback))
+	}
+	entry := snap.Writeback[0]
+	if entry.Path != "/stuck.bin" || entry.Retries != 1 {
+		t.Fatalf("entry = %+v, want path /stuck.bin retries 1", entry)
+	}
+	// The scripted 500 is an upstream outage: the ledger must name the stable
+	// category, not just a free-text error (issue #23).
+	if entry.Category != "upstream_transient" {
+		t.Fatalf("entry category = %q, want upstream_transient", entry.Category)
+	}
+	if entry.Err == "" || strings.Contains(entry.Err, "session-cookie") {
+		t.Fatalf("entry error = %q, want redacted detail", entry.Err)
+	}
+
+	// A success on a different path must not clear the stuck one.
+	resp, _ = davReq(t, "PUT", s.url(t, "/other.txt"), "hello", nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("other put status = %d, want 201", resp.StatusCode)
+	}
+	if got := len(rec.Snapshot().Writeback); got != 1 {
+		t.Fatalf("writeback after other success = %d entries, want 1", got)
+	}
+
+	// The retry that goes through clears the ledger: the file is no longer
+	// broken, so it must stop looking broken.
+	resp, _ = davReq(t, "PUT", s.url(t, "/stuck.bin"), "hello", nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("retry put status = %d, want 201", resp.StatusCode)
+	}
+	if got := len(rec.Snapshot().Writeback); got != 0 {
+		t.Fatalf("writeback after retry success = %d entries, want 0", got)
+	}
+}
+
+// TestDiagnosticsServesSnapshot pins the /diagnostics contract: it sits behind
+// the cookie gate, answers with the recorder's snapshot, and never echoes the
+// credential.
+func TestDiagnosticsServesSnapshot(t *testing.T) {
+	f := newFakeDrive(t)
+	rec := diag.NewRecorder()
+	rec.RunProbe(context.Background(), diag.ProbeAuth, func(context.Context) error { return nil })
+	rec.RecordWritebackFailure("/stuck.bin", errors.New("boom"))
+	s := f.startServer(t, func(c *Config) { c.Recorder = rec })
+
+	// Without the cookie the snapshot is refused.
+	req, err := http.NewRequest("GET", "http://"+s.Addr()+"/diagnostics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no-cookie diagnostics = %d, want 401", resp.StatusCode)
+	}
+
+	resp, body := davReq(t, "GET", "http://"+s.Addr()+"/diagnostics", "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("diagnostics = %d", resp.StatusCode)
+	}
+	compact := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\n' {
+			return -1
+		}
+		return r
+	}, body)
+	for _, want := range []string{
+		`"copy":false`, `"overwrite_upload":false`, `"list":true`,
+		`"name":"auth"`, `stuck.bin`,
+	} {
+		if !strings.Contains(compact, want) {
+			t.Fatalf("diagnostics missing %s: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "session-cookie") {
+		t.Fatal("diagnostics leaked the cookie")
+	}
+
+	// Only the endpoint's own methods are welcome there.
+	resp, _ = davReq(t, "DELETE", "http://"+s.Addr()+"/diagnostics", "", nil)
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("DELETE diagnostics = %d, want 405", resp.StatusCode)
 	}
 }

@@ -25,6 +25,7 @@ import (
 
 	"github.com/muou000/quark-rclone/internal/adapter"
 	"github.com/muou000/quark-rclone/internal/dav"
+	"github.com/muou000/quark-rclone/internal/diag"
 	"github.com/muou000/quark-rclone/internal/quarkapi"
 	"github.com/muou000/quark-rclone/internal/session"
 )
@@ -50,6 +51,10 @@ type Config struct {
 	// HTTPClient is the wire client's transport. Tests inject one bound to
 	// the fake; nil uses the default.
 	HTTPClient *http.Client
+	// Recorder is the shared capability/writeback recorder (issue #22). When
+	// set, the adapter endpoint records refused writebacks and serves the
+	// capability snapshot; nil disables recording.
+	Recorder *diag.Recorder
 }
 
 // Session is one running mount session. Stop tears everything down.
@@ -87,6 +92,7 @@ func Start(ctx context.Context, cfg Config) (*Session, error) {
 		Cookie:   cfg.Cookie,
 		RootFID:  cfg.RootFID,
 		Service:  svc,
+		Recorder: cfg.Recorder,
 	})
 	if err := server.Listen(); err != nil {
 		return nil, err

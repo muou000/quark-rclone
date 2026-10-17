@@ -1,6 +1,8 @@
 package supervisor
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -9,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/muou000/quark-rclone/internal/diag"
 )
 
 // listenLocal reserves an ephemeral loopback port.
@@ -142,6 +146,47 @@ func TestStartRejectsUnusableConfig(t *testing.T) {
 				t.Fatal("Start accepted an unusable config")
 			}
 		})
+	}
+}
+
+// TestSessionServesCapabilitySnapshot checks the recorder plumbs through to
+// the endpoint (issue #22): /diagnostics sits behind the cookie gate and
+// answers with the shared snapshot.
+func TestSessionServesCapabilitySnapshot(t *testing.T) {
+	rec := diag.NewRecorder()
+	rec.RunProbe(t.Context(), diag.ProbeAuth, func(context.Context) error { return nil })
+	rec.RecordWritebackFailure("/stuck.bin", errors.New("boom"))
+	s := startSession(t, func(c *Config) { c.Recorder = rec })
+	base := strings.TrimSuffix(s.URL(), "/dav")
+
+	req, _ := http.NewRequest("GET", base+"/diagnostics", nil)
+	req.Header.Set("Cookie", "__puus=session-seed")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("diagnostics = %d", resp.StatusCode)
+	}
+	for _, want := range []string{`"name": "auth"`, `stuck.bin`, `"copy": false`} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("diagnostics missing %s: %s", want, body)
+		}
+	}
+	if strings.Contains(string(body), "__puus=session-seed") {
+		t.Fatal("diagnostics leaked the cookie")
+	}
+
+	// Without the cookie it is closed like the DAV surface.
+	resp, err = http.Get(base + "/diagnostics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("diagnostics without cookie = %d, want 401", resp.StatusCode)
 	}
 }
 

@@ -78,7 +78,9 @@ func Classify(apiErr *APIError) quarkerr.Category {
 		return quarkerr.CatPermissionDenied
 	case http.StatusNotFound:
 		return quarkerr.CatObjectNotFound
-	case http.StatusConflict:
+	case http.StatusConflict, http.StatusPreconditionFailed:
+		// A real conditional-request failure may arrive as 412; ADR 0010 keeps
+		// it in the same target-conflict category as 409.
 		return quarkerr.CatTargetConflict
 	case http.StatusLocked:
 		return quarkerr.CatLocked
@@ -103,6 +105,10 @@ func Classify(apiErr *APIError) quarkerr.Category {
 		return quarkerr.CatPermissionDenied
 	case apiErr.Status == http.StatusNotFound:
 		return quarkerr.CatObjectNotFound
+	case apiErr.Status == http.StatusConflict || apiErr.Status == http.StatusPreconditionFailed:
+		return quarkerr.CatTargetConflict
+	case apiErr.Status == http.StatusLocked:
+		return quarkerr.CatLocked
 	case apiErr.Status == http.StatusTooManyRequests:
 		return quarkerr.CatRateLimited
 	case apiErr.Status >= 500:
@@ -276,6 +282,15 @@ func (c *Client) RefreshSessionCookie(ctx context.Context) error {
 		c.source.MergeRefresh(fields)
 	}
 	return nil
+}
+
+// ProbeConfig performs the cheapest authenticated call — /config — with the
+// current credential and no side effects beyond the response's refresh
+// merge. It is the real-readiness probe ADR 0004 asks a supervisor to run
+// before rclone starts.
+func (c *Client) ProbeConfig(ctx context.Context) error {
+	_, err := c.doExplicit(ctx, EndpointConfig, http.MethodGet, nil, nil, c.source.CookieSnapshot(), nil)
+	return err
 }
 
 // applyRefresh merges observed refresh fields into a cookie string.
