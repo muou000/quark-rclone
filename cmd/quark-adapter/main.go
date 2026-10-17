@@ -20,17 +20,27 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/muou000/quark-rclone/internal/adapter"
+	"github.com/muou000/quark-rclone/internal/dav"
 	"github.com/muou000/quark-rclone/internal/quarkapi"
 	"github.com/muou000/quark-rclone/internal/quarkerr"
 	"github.com/muou000/quark-rclone/internal/redact"
 	"github.com/muou000/quark-rclone/internal/session"
+	"github.com/muou000/quark-rclone/internal/supervisor"
 )
+
+// defaultLoopbackPort is the fixed port the loopback endpoint binds when the
+// caller does not choose one. ADR 0009 fixes the port for supervisor and
+// diagnostic predictability; any uncommon free port serves.
+const defaultLoopbackPort = 17385
 
 const usage = `quark-adapter — standalone harness for the Quark adapter core
 
@@ -48,10 +58,13 @@ commands:
   delete        delete an object by FID
   refresh       force a session cookie refresh now
   keepalive     run the periodic session refresh until interrupted
+  serve         serve the loopback WebDAV endpoint until interrupted
+  mount         run one mount session: endpoint + temporary rclone config
   capabilities  print the backend capability statement
 
 common flags:
   -cookie-file path   file holding the active cookie (import writes it)
+  -port number        fixed loopback port for serve/mount (default 17385)
 `
 
 func main() {
@@ -172,6 +185,10 @@ func run(ctx context.Context, cmd string, args []string) error {
 		})
 	case "keepalive":
 		return runKeepalive(ctx, args)
+	case "serve":
+		return runServe(ctx, args)
+	case "mount":
+		return runMount(ctx, args)
 	case "capabilities":
 		caps := adapter.CapabilitiesOf()
 		fmt.Printf("copy:             %s\n", supportStr(caps.Copy))
@@ -255,14 +272,143 @@ func runKeepalive(ctx context.Context, args []string) error {
 	return nil
 }
 
+// runServe runs the loopback WebDAV endpoint until interrupted. It is the
+// diagnostics form of the mount session: everything but rclone.
+func runServe(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	cookieFile := fs.String("cookie-file", "", "file holding the active cookie (required)")
+	port := fs.Int("port", defaultLoopbackPort, "fixed loopback port")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *cookieFile == "" {
+		return errors.New("serve requires -cookie-file")
+	}
+	svc, store, err := wireService(*cookieFile)
+	if err != nil {
+		return err
+	}
+	server := dav.New(dav.Config{
+		Addr:    fmt.Sprintf("127.0.0.1:%d", *port),
+		Cookie:  store.CookieSnapshot(),
+		Service: svc,
+	})
+	if err := server.Listen(); err != nil {
+		return err
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve() }()
+	fmt.Fprintf(os.Stderr, "serving dav on http://%s/dav\n", server.Addr())
+
+	select {
+	case <-ctx.Done():
+	case err := <-serveErr:
+		if err != nil && err != http.ErrServerClosed {
+			return err
+		}
+	}
+	// Draining is the endpoint's shutdown contract: in-flight transfers
+	// finish before the process exits.
+	sd, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fmt.Fprintln(os.Stderr, "draining in-flight requests...")
+	return server.Shutdown(sd)
+}
+
+// runMount runs one mount session: the endpoint, a temporary rclone config,
+// optionally rclone itself, and the cleanup of all of it on the way out. The
+// cookie reaches rclone only through the 0600 config file, never the command
+// line (issue #18).
+func runMount(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("mount", flag.ContinueOnError)
+	cookieFile := fs.String("cookie-file", "", "file holding the active cookie (required)")
+	port := fs.Int("port", defaultLoopbackPort, "fixed loopback port")
+	rclone := fs.String("rclone", "", "path to the rclone binary; empty prints the mount command instead of running it")
+	mountPoint := fs.String("mount-point", "", "drive letter or directory rclone mounts at")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *cookieFile == "" {
+		return errors.New("mount requires -cookie-file")
+	}
+	cookie, err := readCookieFile(*cookieFile)
+	if err != nil {
+		return err
+	}
+	// Rotations during the session persist back to the cookie file, which is
+	// the supervisor's DPAPI persistence for now.
+	sess, err := supervisor.Start(ctx, supervisor.Config{
+		Port:    *port,
+		Cookie:  cookie,
+		Persist: func(effective string) { writeCookieFile(*cookieFile, effective) },
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "endpoint: %s\n", sess.URL())
+	fmt.Fprintf(os.Stderr, "rclone config: %s\n", sess.ConfigPath())
+
+	var runner *exec.Cmd
+	if *rclone != "" {
+		if *mountPoint == "" {
+			sess.Stop()
+			return errors.New("mount with -rclone requires -mount-point")
+		}
+		runner = exec.Command(*rclone, "mount", "quark:", *mountPoint, "--config", sess.ConfigPath())
+		runner.Stdout = os.Stdout
+		runner.Stderr = os.Stderr
+		if err := runner.Start(); err != nil {
+			sess.Stop()
+			return fmt.Errorf("start rclone: %w", err)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "run: rclone mount quark: <mount-point> --config %s\n", sess.ConfigPath())
+	}
+
+	rcloneDone := make(chan error, 1)
+	if runner != nil {
+		go func() { rcloneDone <- runner.Wait() }()
+	}
+	select {
+	case err := <-rcloneDone:
+		sess.Stop()
+		return err
+	case err := <-sess.Done():
+		// The endpoint died under us; the mount session is over.
+		if runner != nil {
+			_ = runner.Process.Kill()
+			<-rcloneDone
+		}
+		sess.Stop()
+		return fmt.Errorf("endpoint stopped serving: %w", err)
+	case <-ctx.Done():
+		if runner != nil {
+			_ = runner.Process.Kill()
+			<-rcloneDone
+		}
+		sess.Stop()
+		fmt.Fprintln(os.Stderr, "mount session ended; temporary config deleted")
+		return nil
+	}
+}
+
+// readCookieFile loads the active cookie from disk.
+func readCookieFile(path string) (string, error) {
+	cookie, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read cookie file: %w", err)
+	}
+	return strings.TrimSpace(string(cookie)), nil
+}
+
 // wireService loads the cookie file and builds the adapter on top of a store
 // that persists every rotation back to that file.
 func wireService(cookieFile string) (*adapter.Service, *session.Store, error) {
-	cookie, err := os.ReadFile(cookieFile)
+	cookie, err := readCookieFile(cookieFile)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read cookie file: %w", err)
+		return nil, nil, err
 	}
-	store := session.NewStore(strings.TrimSpace(string(cookie)), func(effective string) {
+	store := session.NewStore(cookie, func(effective string) {
 		writeCookieFile(cookieFile, effective)
 	})
 	return adapter.New(quarkapi.New(store, quarkapi.Config{}, nil), store), store, nil
