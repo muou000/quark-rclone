@@ -395,3 +395,54 @@ func TestPreflightWithoutHookAnswersHonestly(t *testing.T) {
 		t.Errorf("preflight without hook = %s, want an honest refusal", body)
 	}
 }
+
+// TestApplySurvivesRequestDisconnection pins the lifecycle-context contract:
+// the wizard's HTTP request ends the moment its answer is written, but the
+// mount it just started must live on. A request-scoped context reaching the
+// supervisor killed every panel-applied mount the instant the page saw
+// "已应用，挂载重启中…" (observed on a real first-run: apply → Disabled in
+// the same second).
+func TestApplySurvivesRequestDisconnection(t *testing.T) {
+	h := newManagerHarness(t, MountOptions{Letter: "Q:", RootFID: "r1", RootPath: "/docs"})
+	s := NewServer(h.mgr, "panel-token-123")
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("POST", "/api/apply", strings.NewReader(`{"cookie":"good","letter":"Q"}`)).WithContext(reqCtx)
+	req.Header.Set("X-Panel-Token", "panel-token-123")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `"ok":true`) {
+		t.Fatalf("apply = %s", body)
+	}
+
+	// The client goes away right after the answer, as browsers do.
+	cancel()
+
+	if len(h.startCtxs) != 1 {
+		t.Fatalf("starts = %d, want 1", len(h.startCtxs))
+	}
+	select {
+	case <-h.startCtxs[0].Done():
+		t.Fatal("the started mount's context died with the HTTP request")
+	default:
+	}
+
+	// Reauth shares the contract.
+	h2 := newManagerHarness(t, MountOptions{Letter: "Q:", RootFID: "r1", RootPath: "/docs"})
+	s2 := NewServer(h2.mgr, "panel-token-123")
+	reqCtx2, cancel2 := context.WithCancel(context.Background())
+	req2 := httptest.NewRequest("POST", "/api/reauth", strings.NewReader(`{"cookie":"good"}`)).WithContext(reqCtx2)
+	req2.Header.Set("X-Panel-Token", "panel-token-123")
+	w2 := httptest.NewRecorder()
+	s2.Handler().ServeHTTP(w2, req2)
+	w2.Result().Body.Close()
+	cancel2()
+	select {
+	case <-h2.startCtxs[0].Done():
+		t.Fatal("the reauth restart's context died with the HTTP request")
+	default:
+	}
+}

@@ -182,13 +182,17 @@ func (s *Server) serveValidate(w http.ResponseWriter, r *http.Request) {
 
 // serveApply runs the full first-run configuration: validate, persist
 // credential, save root/drive choices, restart. Validation failure leaves
-// every durable store untouched (AC 2).
+// every durable store untouched (AC 2). The lifecycle work is detached from
+// the HTTP request — the same contract as recheck: the handler answers
+// "已应用，挂载重启中…" and returns, and the mount it just started must not
+// die with the request's context.
 func (s *Server) serveApply(w http.ResponseWriter, r *http.Request) {
+	ctx := context.WithoutCancel(r.Context())
 	req, ok := decodeWizard(w, r)
 	if !ok {
 		return
 	}
-	err := s.mgr.Apply(r.Context(), req.Cookie, MountOptions{
+	err := s.mgr.Apply(ctx, req.Cookie, MountOptions{
 		Letter:   req.Letter,
 		RootFID:  req.RootFID,
 		RootPath: req.RootPath,
@@ -198,13 +202,15 @@ func (s *Server) serveApply(w http.ResponseWriter, r *http.Request) {
 
 // serveReauth is the NeedsReauth path (AC 3): validate the new cookie,
 // persist it, restart — with no options touched, so root, drive letter,
-// profile and dirty cache survive as they are.
+// profile and dirty cache survive as they are. The restart outlives the
+// request, so its context is detached like apply's.
 func (s *Server) serveReauth(w http.ResponseWriter, r *http.Request) {
+	ctx := context.WithoutCancel(r.Context())
 	req, ok := decodeWizard(w, r)
 	if !ok {
 		return
 	}
-	err := s.mgr.Apply(r.Context(), req.Cookie, MountOptions{})
+	err := s.mgr.Apply(ctx, req.Cookie, MountOptions{})
 	applyResult(w, err)
 }
 

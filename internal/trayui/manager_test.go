@@ -133,12 +133,13 @@ func (s *fakeSource) ListDirs(_ context.Context, _ string) ([]RootDir, error) {
 type managerHarness struct {
 	mgr       *Manager
 	src       *fakeSource
-	started   []string       // effective cookies handed to start
-	optsSeen  []MountOptions // options handed to start
-	persisted []string       // cookies persisted
-	savedCfg  []MountOptions // configs saved
-	failStart error          // when set, start fails
-	runners   []*fakeRunner  // one fresh runner per start, like real lifecycles
+	started   []string          // effective cookies handed to start
+	startCtxs []context.Context // contexts handed to start
+	optsSeen  []MountOptions    // options handed to start
+	persisted []string          // cookies persisted
+	savedCfg  []MountOptions    // configs saved
+	failStart error             // when set, start fails
+	runners   []*fakeRunner     // one fresh runner per start, like real lifecycles
 	rec       *diag.Recorder
 }
 
@@ -153,11 +154,12 @@ func newManagerHarness(t *testing.T, opts MountOptions) *managerHarness {
 	}
 	h.mgr = NewManager(
 		h.src,
-		func(_ context.Context, effective string, opts MountOptions) (MountRunner, *diag.Recorder, error) {
+		func(ctx context.Context, effective string, opts MountOptions) (MountRunner, *diag.Recorder, error) {
 			if h.failStart != nil {
 				return nil, nil, h.failStart
 			}
 			h.started = append(h.started, effective)
+			h.startCtxs = append(h.startCtxs, ctx)
 			h.optsSeen = append(h.optsSeen, opts)
 			// A restart must get a fresh lifecycle: reusing one whose Done
 			// already closed would retire the new pump instantly.
