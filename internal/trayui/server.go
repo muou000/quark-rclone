@@ -36,6 +36,9 @@ type Hooks struct {
 	// Upgrade applies the staged upgrade: the caller stops the mount first
 	// and restarts it afterwards (ADR 0006's order).
 	Upgrade func(ctx context.Context) error
+	// Preflight runs the runtime pre-check (the doctor chain) in-process and
+	// returns its report for the setup tab's gate. Nil answers honestly.
+	Preflight func(ctx context.Context) PreflightView
 }
 
 // Server serves the tray's local panel: the embedded page, the panel data
@@ -70,6 +73,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.servePanel)
 	mux.HandleFunc("GET /api/panel", s.servePanelData)
+	mux.HandleFunc("GET /api/preflight", s.servePreflight)
 	mux.HandleFunc("GET /api/log", s.serveLogExport)
 	mux.HandleFunc("POST /api/validate", s.guard(s.serveValidate))
 	mux.HandleFunc("POST /api/apply", s.guard(s.serveApply))
@@ -113,6 +117,23 @@ func (s *Server) servePanelData(w http.ResponseWriter, r *http.Request) {
 		data.UpgradeVersion = s.hooks.StagedVersion()
 	}
 	writeJSON(w, data)
+}
+
+// servePreflight answers the setup tab's gate: the doctor chain's static
+// gates (platform, bundled rclone, WinFsp) run in-process — the mount
+// self-test is deliberately absent, since a real mount attempt cannot run
+// against the letter this very tray may already hold. A read-only GET like
+// /api/panel, so the token guard does not apply; nothing here can drive the
+// mount.
+func (s *Server) servePreflight(w http.ResponseWriter, r *http.Request) {
+	if s.hooks.Preflight == nil {
+		writeJSON(w, PreflightView{OK: false, Status: "unavailable", Findings: []PreflightFindingView{{
+			Check: "preflight", OK: false,
+			Detail: "此构建不支持内置预检：请使用 quark-adapter doctor 查看运行环境。",
+		}}})
+		return
+	}
+	writeJSON(w, s.hooks.Preflight(r.Context()))
 }
 
 // serveLogExport streams the redacted event log as a text file (AC 4).

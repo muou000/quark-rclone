@@ -116,29 +116,50 @@
       登录已失效：请在下方粘贴新的 Cookie 重新登录。根目录与盘符选择将保持不变；验证失败不会改动旧凭据。
     </div>
     <div class="card">
-      <h2 id="setup-title">首次配置 / 重新登录</h2>
-      <label for="cookie">粘贴浏览器导出的 Cookie</label>
-      <textarea id="cookie" placeholder="整行粘贴，包含 __puus 等字段；提交前会先验证"></textarea>
+      <h2>运行预检</h2>
+      <div id="preflight-body" class="muted">检查中…</div>
       <div class="row">
-        <button class="primary" id="btn-validate">1. 验证并选择根目录</button>
-        <span class="muted">验证成功前不会保存任何内容</span>
+        <button class="ghost" id="btn-preflight">重新预检</button>
+        <span id="preflight-msg" class="muted">环境全部通过后才会展开下方的配置向导。</span>
       </div>
-      <div id="validate-msg" class="msg"></div>
+    </div>
+    <div id="wizard-block" style="display:none">
+      <div class="card">
+        <h2 id="setup-title">首次配置 / 重新登录</h2>
+        <div class="notice">
+          <b>如何获取 Cookie：</b>
+          <ol style="margin:6px 0 0; padding-left:18px">
+            <li>用浏览器登录 pan.quark.cn</li>
+            <li>按 <b>F12</b> 打开开发者工具，切到「网络 / Network」标签，刷新页面</li>
+            <li>在请求列表中点任意一个发往 pan.quark.cn 的请求，切到「标头 / Headers」</li>
+            <li>下拉到「请求标头 / Request Headers」，找到 <code>Cookie:</code> 一行，复制冒号后的<b>完整内容</b>（很长，从第一个字段到最后一个，别漏结尾）</li>
+            <li>粘贴到下方输入框：<b>不要带 <code>Cookie:</code> 前缀，不要加引号</b></li>
+          </ol>
+          <div class="muted" style="margin-top:6px">Cookie 等同登录凭证，请勿提供给任何人；本程序仅保存在本机，并使用 DPAPI（当前用户）加密。</div>
+        </div>
+        <label for="cookie">粘贴浏览器导出的 Cookie</label>
+        <textarea id="cookie" placeholder="整行粘贴，包含 __puus 等字段；提交前会先验证"></textarea>
+        <div class="row">
+          <button class="primary" id="btn-validate">1. 验证并选择根目录</button>
+          <span class="muted">验证成功前不会保存任何内容</span>
+        </div>
+        <div id="validate-msg" class="msg"></div>
 
-      <div id="wizard-step2" style="display:none">
-        <label for="root-dir">选择挂载的根目录</label>
-        <select id="root-dir"></select>
-        <label>盘符</label>
-        <div class="row">
-          <input type="radio" name="drivemode" value="auto" checked><span>自动选择</span>
-          <input type="radio" name="drivemode" value="explicit"><span>指定盘符</span>
-          <input id="letter" placeholder="如 Q" maxlength="2" style="width:80px" disabled>
+        <div id="wizard-step2" style="display:none">
+          <label for="root-dir">选择挂载的根目录</label>
+          <select id="root-dir"></select>
+          <label>盘符</label>
+          <div class="row">
+            <input type="radio" name="drivemode" value="auto" checked><span>自动选择</span>
+            <input type="radio" name="drivemode" value="explicit"><span>指定盘符</span>
+            <input id="letter" placeholder="如 Q" maxlength="2" style="width:80px" disabled>
+          </div>
+          <div class="row">
+            <button class="primary" id="btn-apply">2. 应用并挂载</button>
+            <span class="muted">将验证通过的新凭据与选择写入配置并重启挂载</span>
+          </div>
+          <div id="apply-msg" class="msg"></div>
         </div>
-        <div class="row">
-          <button class="primary" id="btn-apply">2. 应用并挂载</button>
-          <span class="muted">将验证通过的新凭据与选择写入配置并重启挂载</span>
-        </div>
-        <div id="apply-msg" class="msg"></div>
       </div>
     </div>
     <div class="card">
@@ -244,6 +265,23 @@ function render(d) {
   }
 }
 
+async function loadPreflight() {
+  const body = $("preflight-body");
+  body.innerHTML = '<span class="muted">检查中…</span>';
+  try {
+    const r = await fetch("/api/preflight");
+    const j = await r.json();
+    const rows = (j.findings || []).map(f =>
+      `<tr><td>${esc(f.label || f.check)}</td><td style="color:${f.ok ? "var(--ok)" : "var(--bad)"}">${f.ok ? "通过" : "未通过"}</td><td>${esc(f.detail)}</td></tr>`).join("");
+    body.innerHTML = rows ? `<table><tbody>${rows}</tbody></table>` : '<span class="muted">无结果</span>';
+    $("wizard-block").style.display = j.ok ? "block" : "none";
+  } catch (e) {
+    body.innerHTML = '<span style="color:var(--bad)">预检请求失败：请点击「重新预检」重试。</span>';
+    $("wizard-block").style.display = "none";
+  }
+}
+$("btn-preflight").onclick = () => loadPreflight();
+
 $("btn-validate").onclick = async () => {
   const msg = $("validate-msg");
   msg.className = "msg"; msg.textContent = "验证中…";
@@ -289,6 +327,7 @@ $("btn-apply").onclick = async () => {
 };
 
 panel();
+loadPreflight();
 setInterval(panel, 2000);
 
 $("btn-recheck").onclick = async () => {
