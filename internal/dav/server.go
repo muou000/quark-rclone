@@ -3,6 +3,7 @@ package dav
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/muou000/quark-rclone/internal/adapter"
+	"github.com/muou000/quark-rclone/internal/diag"
 	"github.com/muou000/quark-rclone/internal/quarkerr"
 	"golang.org/x/net/webdav"
 )
@@ -35,6 +37,11 @@ var refusedMethods = map[string]bool{"COPY": true, "PROPPATCH": true, "POST": tr
 var passthroughHeaders = []string{
 	"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified",
 }
+
+// classHeader carries the stable error category alongside every error this
+// endpoint authors (issue #22, ADR 0010). A mount client reads the body or
+// the status; a diagnostic reader greps the header.
+const classHeader = "X-Quark-Error-Class"
 
 // Config is the loopback endpoint's wiring.
 type Config struct {
@@ -65,6 +72,10 @@ type Config struct {
 	// production default; a negative keeps listings until a write invalidates
 	// them.
 	DirTTL time.Duration
+	// Recorder is the shared capability/writeback recorder (issue #22). When
+	// set, a refused upload lands in the writeback ledger a successful retry
+	// clears, and /diagnostics serves the snapshot. Nil disables recording.
+	Recorder *diag.Recorder
 }
 
 // Server is one loopback WebDAV endpoint.
@@ -93,7 +104,7 @@ func New(cfg Config) *Server {
 		cfg.DirTTL = 30 * time.Second
 	}
 	s := &Server{cfg: cfg}
-	s.fs = NewFS(cfg.Service, cfg.RootFID, cfg.Timeouts, cfg.DirTTL)
+	s.fs = NewFS(cfg.Service, cfg.RootFID, cfg.Timeouts, cfg.DirTTL, cfg.Recorder)
 	// The CDN client refuses redirects: a signed URL that redirects must not
 	// silently drop the Cookie and Referer the signature was minted against.
 	// The 3xx passes through to the loopback client instead.
@@ -193,6 +204,20 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.serveCapabilities(w)
 		return
 	}
+	if r.URL.Path == "/diagnostics" {
+		// The snapshot names user files, so unlike /healthz and
+		// /capabilities it sits behind the same credential gate as /dav.
+		if !s.cookieOK(r) {
+			writeDAVError(w, http.StatusUnauthorized, quarkerr.CatAuthRequired,
+				"missing or invalid Cookie header")
+			return
+		}
+		if !requireMethod(w, r, http.MethodGet, http.MethodHead) {
+			return
+		}
+		s.serveDiagnostics(w)
+		return
+	}
 	if !strings.HasPrefix(r.URL.Path, s.cfg.BasePath+"/") && r.URL.Path != s.cfg.BasePath {
 		http.NotFound(w, r)
 		return
@@ -227,6 +252,25 @@ func (s *Server) serveCapabilities(w http.ResponseWriter) {
 		fmt.Fprintf(w, "%q", m)
 	}
 	_, _ = w.Write([]byte("]}\n"))
+}
+
+// serveDiagnostics answers with the capability snapshot (issue #22): the
+// static operation matrix, the probe outcomes and the writeback ledger. The
+// recorder redacts every error text on the way in, so the response carries no
+// credential and no signed URL even though it names user files.
+func (s *Server) serveDiagnostics(w http.ResponseWriter) {
+	snap := diag.Snapshot{Static: diag.StaticCapsOf()}
+	if s.cfg.Recorder != nil {
+		snap = s.cfg.Recorder.Snapshot()
+	}
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		http.Error(w, "diagnostics unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(data)
+	_, _ = w.Write([]byte("\n"))
 }
 
 // serveDav is the gated WebDAV surface. The order matters: the cookie gate
@@ -288,6 +332,7 @@ func (s *Server) servePut(w http.ResponseWriter, r *http.Request) {
 	if err := holder.get(); err != nil && status >= 400 {
 		status = quarkerr.StatusCode(err)
 		body = statusText(status)
+		w.Header().Set(classHeader, string(quarkerr.CategoryOf(err)))
 	} else if status >= 400 && r.Context().Err() != nil {
 		// The body died mid-transfer — a stalled client cut off by the read
 		// deadline, or a hangup. No provider category exists for it, but the
@@ -295,6 +340,7 @@ func (s *Server) servePut(w http.ResponseWriter, r *http.Request) {
 		// gateway error the mount client should react to.
 		status = http.StatusBadGateway
 		body = statusText(status)
+		w.Header().Set(classHeader, string(quarkerr.CatUpstreamTransient))
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(status)
@@ -378,8 +424,11 @@ func (s *Server) serveDownload(w http.ResponseWriter, r *http.Request) {
 
 // writeDAVError answers with the stable JSON error shape of this endpoint:
 // a quarkerr category and a message this package authored, so no provider
-// text and no credential ever reach the wire.
+// text and no credential ever reach the wire. The category also rides the
+// X-Quark-Error-Class header, which is what rclone/VFS's errno mapping (and a
+// grep-happy diagnostician) keys on.
 func writeDAVError(w http.ResponseWriter, status int, cat quarkerr.Category, detail string) {
+	w.Header().Set(classHeader, string(cat))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	fmt.Fprintf(w, "{\"error\":%q,\"message\":%q}\n", string(cat), detail)

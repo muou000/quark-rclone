@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/muou000/quark-rclone/internal/diag"
 	"github.com/muou000/quark-rclone/internal/preflight"
 	"github.com/muou000/quark-rclone/internal/redact"
 )
@@ -38,6 +39,13 @@ type SupervisorConfig struct {
 	BackoffSchedule []time.Duration
 	ShutdownTimeout time.Duration
 	StatePath       string
+
+	// Diagnostics (issue #22). Recorder is the capability/writeback ledger
+	// the adapter endpoint shares; ProbeCaps runs the side-effect-free
+	// capability probes after readiness succeeded. Probe failures are
+	// recorded, never fatal — diagnostics must not gate the mount.
+	Recorder  *diag.Recorder
+	ProbeCaps func(ctx context.Context)
 
 	// Injection seams. Production leaves them nil.
 	Preflight    func() error
@@ -306,6 +314,11 @@ func (s *Supervisor) runAttempt() State {
 		}
 	}
 
+	// The capability probes run after readiness (ADR 0010: startup and
+	// re-authentication probe without side effects) and never block or fail
+	// the mount — their outcomes land in the snapshot, that is all.
+	s.runProbes()
+
 	// The letter must be free before rclone is asked to take it: a volume
 	// already mounted there would make the visibility probe succeed
 	// instantly and fake a healthy mount.
@@ -359,10 +372,11 @@ func (s *Supervisor) ensureAdapter() error {
 	}
 	s.transition(StateStarting, "adapter", "")
 	sess, err := Start(s.ctx, Config{
-		Port:    s.cfg.Port,
-		Cookie:  s.cfg.Cookie,
-		Persist: s.cfg.Persist,
-		RootFID: s.cfg.RootFID,
+		Port:     s.cfg.Port,
+		Cookie:   s.cfg.Cookie,
+		Persist:  s.cfg.Persist,
+		RootFID:  s.cfg.RootFID,
+		Recorder: s.cfg.Recorder,
 	})
 	if err != nil {
 		s.transition(StateFailed, "adapter", fmt.Sprintf("适配器启动失败：%v", err))
@@ -370,6 +384,16 @@ func (s *Supervisor) ensureAdapter() error {
 	}
 	s.sess = sess
 	return nil
+}
+
+// runProbes refreshes the capability snapshot after readiness (issue #22,
+// ADR 0010). A stopped supervisor records nothing: the lifecycle is on its
+// way out, not starting up.
+func (s *Supervisor) runProbes() {
+	if s.cfg.ProbeCaps == nil || s.ctx.Err() != nil {
+		return
+	}
+	s.cfg.ProbeCaps(s.ctx)
 }
 
 // monitor watches a mounted session until a child dies or shutdown begins.

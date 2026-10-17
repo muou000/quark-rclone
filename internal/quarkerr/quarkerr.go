@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"syscall"
 )
 
 // Category is a stable failure class. It is what the rest of the program
@@ -180,6 +181,50 @@ func StatusCode(err error) int {
 	}
 	return statusFor(CategoryOf(err))
 }
+
+// Errno returns the errno a mount client should surface for a category (ADR
+// 0010). It is the third leg of the category contract: one category, decided
+// once from the provider's response, maps outward to both an HTTP status and
+// an errno, so the WebDAV endpoint's COPY answer and rclone/VFS's ENOSYS can
+// never disagree about what the backend meant.
+//
+// The mapping is about remedy, not similarity: a category whose only remedy is
+// "report it" lands on the errno that makes the caller stop retrying.
+func Errno(cat Category) syscall.Errno {
+	switch cat {
+	case CatAuthRequired:
+		// A dead session is a credential problem; the caller cannot fix it by
+		// retrying and must not confuse it with a missing object.
+		return syscall.EACCES
+	case CatPermissionDenied:
+		return syscall.EACCES
+	case CatObjectNotFound, CatParentNotFound:
+		return syscall.ENOENT
+	case CatTargetConflict:
+		// The existing object must be preserved; EEXIST is the errno whose
+		// contract says exactly that.
+		return syscall.EEXIST
+	case CatLocked:
+		return syscall.EBUSY
+	case CatNotSupported:
+		return syscall.ENOSYS
+	case CatRateLimited, CatUpstreamTransient:
+		return syscall.EAGAIN
+	case CatQuotaExceeded:
+		return syscall.ENOSPC
+	case CatInvalidRequest:
+		return syscall.EINVAL
+	case CatCancelled:
+		return syscall.EINTR
+	}
+	// Internal, unknown and any category added later fall through to EIO: the
+	// last-resort errno of ADR 0010. A zero errno would read as success.
+	return syscall.EIO
+}
+
+// ErrnoOf maps an error through its category. An unclassified error is EIO,
+// matching Errno's fallback.
+func ErrnoOf(err error) syscall.Errno { return Errno(CategoryOf(err)) }
 
 // Permanent reports whether retrying the same request can ever succeed.
 //
