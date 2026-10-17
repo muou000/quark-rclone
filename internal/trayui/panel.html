@@ -141,6 +141,23 @@
         <div id="apply-msg" class="msg"></div>
       </div>
     </div>
+    <div class="card">
+      <h2>开机自启动</h2>
+      <div class="row">
+        <input type="checkbox" id="autostart" style="width:auto">
+        <span style="font-size:13px">当前用户登录时自动启动托盘（不使用服务，无需管理员权限）</span>
+      </div>
+      <div id="autostart-msg" class="msg"></div>
+    </div>
+    <div class="card">
+      <h2>升级</h2>
+      <div id="upgrade-info" class="muted" style="margin-bottom:8px">暂无已暂存的升级。</div>
+      <div class="row" id="upgrade-row" style="display:none">
+        <button class="primary" id="btn-upgrade">停止挂载并应用升级</button>
+        <span class="muted">配置、凭据与 dirty cache 保留；自检失败自动回滚</span>
+      </div>
+      <div id="upgrade-msg" class="msg"></div>
+    </div>
   </section>
 </main>
 <script>
@@ -214,6 +231,17 @@ function render(d) {
   if (s.needs_reauth) { $("setup-title").textContent = "重新登录"; }
   else if (!d.has_credential) { $("setup-title").textContent = "首次配置"; }
   else { $("setup-title").textContent = "配置"; }
+
+  const as = $("autostart");
+  if (as.checked !== !!d.autostart) as.checked = !!d.autostart;
+  const ver = d.upgrade_version || "";
+  if (ver) {
+    $("upgrade-info").textContent = "已暂存升级：" + ver + "。应用前会自动停止挂载并等待盘符释放。";
+    $("upgrade-row").style.display = "flex";
+  } else {
+    $("upgrade-info").textContent = "暂无已暂存的升级。";
+    $("upgrade-row").style.display = "none";
+  }
 }
 
 $("btn-validate").onclick = async () => {
@@ -274,6 +302,35 @@ $("btn-recheck").onclick = async () => {
     panel();
   } catch (e) {
     msg.className = "msg err"; msg.textContent = "请求失败";
+  }
+};
+
+$("autostart").onchange = async () => {
+  const msg = $("autostart-msg");
+  msg.className = "msg"; msg.textContent = "应用中…";
+  try {
+    const r = await fetch("/api/autostart", { method:"POST", headers:H, body: JSON.stringify({ enabled: $("autostart").checked }) });
+    const j = await r.json();
+    if (!j.ok) { msg.className = "msg err"; msg.textContent = j.error || "设置失败"; return; }
+    msg.className = "msg ok"; msg.textContent = j.enabled ? "已开启：下次登录自动启动托盘" : "已关闭";
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = "请求失败";
+  }
+};
+
+$("btn-upgrade").onclick = async () => {
+  const msg = $("upgrade-msg");
+  if (!confirm("将停止挂载并应用已暂存的升级，继续吗？")) return;
+  msg.className = "msg"; msg.textContent = "正在停止挂载并切换版本…";
+  try {
+    const r = await fetch("/api/upgrade", { method:"POST", headers:H });
+    const j = await r.json();
+    if (!j.ok) { msg.className = "msg err"; msg.textContent = j.error || "升级失败"; panel(); return; }
+    msg.className = "msg ok"; msg.textContent = "升级完成，挂载已使用新组件重启";
+    panel();
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = "请求失败";
+    panel();
   }
 };
 </script>

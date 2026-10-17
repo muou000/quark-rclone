@@ -39,6 +39,10 @@ type PanelData struct {
 	CacheDir   string `json:"cache_dir"`
 	MountPoint string `json:"mount_point"`
 
+	// Autostart and UpgradeVersion reflect the shell hooks (issue #25).
+	Autostart      bool   `json:"autostart"`
+	UpgradeVersion string `json:"upgrade_version,omitempty"`
+
 	// Log is the redacted event tail shown on the diagnostics view; the full
 	// export is /api/log.
 	Log []LogEntry `json:"log"`

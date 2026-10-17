@@ -42,6 +42,7 @@ import (
 	"github.com/muou000/quark-rclone/internal/redact"
 	"github.com/muou000/quark-rclone/internal/session"
 	"github.com/muou000/quark-rclone/internal/supervisor"
+	"github.com/muou000/quark-rclone/internal/upgrade"
 )
 
 // defaultLoopbackPort is the fixed port the loopback endpoint binds when the
@@ -71,6 +72,7 @@ commands:
   doctor        run the WinFsp/rclone runtime pre-check (issue #20)
   capabilities  print the backend capability statement
   probe-write   run the manual write diagnostic and print the capability snapshot (issue #22)
+  upgrade-stage stage a release payload into the app root for the tray to apply (issue #25)
 
 common flags:
   -cookie-file path   file holding the active cookie (import writes it)
@@ -213,6 +215,8 @@ func run(ctx context.Context, cmd string, args []string) error {
 		return nil
 	case "probe-write":
 		return runProbeWrite(ctx, args)
+	case "upgrade-stage":
+		return runUpgradeStage(ctx, args)
 	default:
 		return fmt.Errorf("unknown command %q", cmd)
 	}
@@ -501,6 +505,37 @@ func runProbeWrite(ctx context.Context, args []string) error {
 	if failed {
 		return errors.New("写入诊断未通过，详见上方快照")
 	}
+	return nil
+}
+
+// runUpgradeStage stages a release payload into the application root's
+// staging area (issue #25, ADR 0006): copy, hash, self-check the staged
+// bundle. The tray's upgrade action picks it up; nothing here touches the
+// active payload.
+func runUpgradeStage(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("upgrade-stage", flag.ContinueOnError)
+	root := fs.String("root", "", "应用根目录（默认：当前 exe 所在目录）")
+	version := fs.String("version", "", "新版本号（必填）")
+	payload := fs.String("payload", "", "发布载荷目录（quark-tray.exe + quark-adapter.exe + bundle\\，必填）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *version == "" || *payload == "" {
+		return errors.New("upgrade-stage 需要 -version 与 -payload")
+	}
+	dir := *root
+	if dir == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		dir = filepath.Dir(exe)
+	}
+	m := upgrade.New(dir, upgrade.VerifyWithPreflight)
+	if err := m.Stage(ctx, *version, *payload); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "已暂存升级 %s 到 %s\n在托盘的设置页点击「停止挂载并应用升级」，或重启托盘后操作。\n", *version, m.StagingDir())
 	return nil
 }
 

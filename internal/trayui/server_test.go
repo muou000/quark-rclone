@@ -238,3 +238,87 @@ func TestPanelDataCarriesTheDocument(t *testing.T) {
 		t.Error("panel data must never carry a credential")
 	}
 }
+
+func TestShellHooksDriveAutostartAndUpgrade(t *testing.T) {
+	h := newManagerHarness(t, MountOptions{})
+	if err := h.mgr.Start(context.Background(), "seed-cookie"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	var autostartCalls []bool
+	var upgradeCalls int
+	s := NewServer(h.mgr, "panel-token-123").WithHooks(Hooks{
+		AutostartEnabled: func() bool { return len(autostartCalls) > 0 && autostartCalls[len(autostartCalls)-1] },
+		Autostart: func(enabled bool) error {
+			autostartCalls = append(autostartCalls, enabled)
+			return nil
+		},
+		StagedVersion: func() string { return "v9.9" },
+		Upgrade: func(context.Context) error {
+			upgradeCalls++
+			return nil
+		},
+	})
+
+	// The panel document reflects the hooks.
+	resp, err := http.Get(httptest.NewServer(s.Handler()).URL + "/api/panel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `"upgrade_version":"v9.9"`) {
+		t.Errorf("panel data missing the staged version: %s", body)
+	}
+
+	// Autostart toggle goes through the hook, token-guarded.
+	resp = postJSON(t, s.Handler(), "/api/autostart", "", `{"enabled":true}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized autostart = %d, want 401", resp.StatusCode)
+	}
+	resp = postJSON(t, s.Handler(), "/api/autostart", "panel-token-123", `{"enabled":true}`)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `"ok":true`) {
+		t.Fatalf("autostart = %s", body)
+	}
+	if len(autostartCalls) != 1 || !autostartCalls[0] {
+		t.Errorf("autostart hook calls = %v", autostartCalls)
+	}
+
+	// Upgrade goes through the hook, and the panel document then carries the
+	// enabled autostart state.
+	resp = postJSON(t, s.Handler(), "/api/upgrade", "panel-token-123", "")
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `"ok":true`) {
+		t.Fatalf("upgrade = %s", body)
+	}
+	if upgradeCalls != 1 {
+		t.Errorf("upgrade calls = %d", upgradeCalls)
+	}
+	resp, err = http.Get(httptest.NewServer(s.Handler()).URL + "/api/panel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `"autostart":true`) {
+		t.Errorf("panel data missing autostart state: %s", body)
+	}
+}
+
+func TestNilHooksAnswerHonestly(t *testing.T) {
+	h := newManagerHarness(t, MountOptions{})
+	s := NewServer(h.mgr, "panel-token-123")
+
+	for _, path := range []string{"/api/autostart", "/api/upgrade"} {
+		resp := postJSON(t, s.Handler(), path, "panel-token-123", "{}")
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if !strings.Contains(string(body), `"ok":false`) {
+			t.Errorf("%s without hooks = %s, want an honest refusal", path, body)
+		}
+	}
+}
