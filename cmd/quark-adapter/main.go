@@ -33,6 +33,7 @@ import (
 
 	"github.com/muou000/quark-rclone/internal/adapter"
 	"github.com/muou000/quark-rclone/internal/dav"
+	"github.com/muou000/quark-rclone/internal/diag"
 	"github.com/muou000/quark-rclone/internal/preflight"
 	"github.com/muou000/quark-rclone/internal/profile"
 	"github.com/muou000/quark-rclone/internal/quarkapi"
@@ -68,6 +69,7 @@ commands:
   profile       print the mount profile and credential-store state
   doctor        run the WinFsp/rclone runtime pre-check (issue #20)
   capabilities  print the backend capability statement
+  probe-write   run the manual write diagnostic and print the capability snapshot (issue #22)
 
 common flags:
   -cookie-file path   file holding the active cookie (import writes it)
@@ -208,6 +210,8 @@ func run(ctx context.Context, cmd string, args []string) error {
 		fmt.Printf("copy:             %s\n", supportStr(caps.Copy))
 		fmt.Printf("overwrite upload: %s\n", supportStr(caps.OverwriteUpload))
 		return nil
+	case "probe-write":
+		return runProbeWrite(ctx, args)
 	default:
 		return fmt.Errorf("unknown command %q", cmd)
 	}
@@ -441,6 +445,110 @@ func runKeepalive(ctx context.Context, args []string) error {
 	return nil
 }
 
+// runProbeWrite runs the manual write diagnostic (issue #22, ADR 0010): a
+// small file is uploaded into the drive root and deleted again — the only
+// probe with a side effect, and it runs only because the user asked. The
+// outcome lands in the shared capability snapshot and is printed, redacted.
+func runProbeWrite(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("probe-write", flag.ContinueOnError)
+	cookieFile := fs.String("cookie-file", "", "file holding the active cookie (required)")
+	profileDir := fs.String("profile-dir", "", "override the profile directory (diagnostics)")
+	diagPath := fs.String("diag-path", "", "override the capability snapshot file (default: <profile dir>\\diag.json)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *cookieFile == "" {
+		return errors.New("probe-write requires -cookie-file")
+	}
+	svc, _, err := wireService(*cookieFile)
+	if err != nil {
+		return err
+	}
+	rec := diag.NewRecorder()
+	rec.SetPersistPath(resolveDiagPath(*profileDir, *diagPath))
+
+	fmt.Fprintln(os.Stderr, "写入诊断：将在网盘根目录上传并删除一个小文件（quark-write-probe-*.txt）")
+	rec.RunProbe(ctx, diag.ProbeWrite, func(ctx context.Context) error {
+		return writeDiagProbe(ctx, svc)
+	})
+	snap := rec.Snapshot()
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(data))
+	failed := false
+	for _, p := range snap.Probes {
+		mark := "通过"
+		switch {
+		case p.Skipped:
+			mark = "跳过"
+		case !p.OK:
+			mark = "未通过"
+			failed = true
+		}
+		line := fmt.Sprintf("[%s] 探针 %s（%s）", mark, p.Name, p.At.Format("15:04:05"))
+		if p.Err != "" {
+			line += " " + p.Err
+		}
+		fmt.Fprintln(os.Stderr, line)
+	}
+	for _, wb := range snap.Writeback {
+		fmt.Fprintf(os.Stderr, "[回写失败] %s：已重试 %d 次，下次重试 %s\n",
+			wb.Path, wb.Retries, wb.NextRetry.Format("15:04:05"))
+	}
+	if failed {
+		return errors.New("写入诊断未通过，详见上方快照")
+	}
+	return nil
+}
+
+// resolveDiagPath resolves the capability snapshot file: the explicit
+// override, or diag.json in the profile directory (the default profile dir
+// when none was named).
+func resolveDiagPath(profileDir, override string) string {
+	if override != "" {
+		return override
+	}
+	dir := profileDir
+	if dir == "" {
+		var err error
+		if dir, err = profile.DefaultDir(); err != nil {
+			// A resolvable default was already required by credential loading
+			// in every caller; a failure here leaves the recorder in memory
+			// only, which degrades diagnostics, not the mount.
+			return ""
+		}
+	}
+	return filepath.Join(dir, diag.SnapshotFile)
+}
+
+// diagProbeContent is the diagnostic file's whole content: self-describing and
+// free of anything worth protecting, because a diagnostic that needs redacting
+// is a diagnostic that will not get written.
+const diagProbeContent = "quark-rclone write diagnostic — uploaded and deleted by probe-write.\n"
+
+// writeDiagProbe uploads the small diagnostic file into the drive root and
+// deletes it. A cleanup failure is reported as the probe's failure: an
+// orphaned probe file the user cannot see would be worse than an honest
+// error.
+func writeDiagProbe(ctx context.Context, svc *adapter.Service) error {
+	name := fmt.Sprintf("quark-write-probe-%d.txt", time.Now().Unix())
+	fid, err := svc.Upload(ctx, adapter.UploadRequest{
+		ParentFID:   quarkapi.RootFID,
+		Name:        name,
+		Size:        int64(len(diagProbeContent)),
+		ContentType: "text/plain",
+	}, strings.NewReader(diagProbeContent), nil)
+	if err != nil {
+		return err
+	}
+	if err := svc.Delete(ctx, fid); err != nil {
+		return fmt.Errorf("已上传 %s 但清理失败：%w", name, err)
+	}
+	return nil
+}
+
 // runServe runs the loopback WebDAV endpoint until interrupted. It is the
 // diagnostics form of the mount session: everything but rclone.
 func runServe(ctx context.Context, args []string) error {
@@ -499,6 +607,7 @@ func runMount(ctx context.Context, args []string) error {
 	mountPoint := fs.String("mount-point", "", "drive letter or directory rclone mounts at")
 	bundleDir := fs.String("bundle-dir", "", "override the runtime bundle directory for the pre-check (default: <exe>\\bundle)")
 	statePathFlag := fs.String("state-path", "", "override the lifecycle state file (default: profile dir\\state.json in -profile mode)")
+	diagPathFlag := fs.String("diag-path", "", "override the capability snapshot file (default: <profile dir>\\diag.json)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -562,6 +671,39 @@ func runMount(ctx context.Context, args []string) error {
 	// credential, probed before rclone is ever asked to mount.
 	probeStore := session.NewStore(cookie, nil)
 	probeAPI := quarkapi.New(probeStore, quarkapi.Config{}, nil)
+
+	// Issue #22: the capability snapshot and the writeback ledger live beside
+	// the profile, so a later probe-write and the tray read the same truth the
+	// running mount wrote. The probes are the side-effect-free trio of ADR
+	// 0010 — auth, root list, read link — run after readiness succeeds; the
+	// write probe never runs here, it is manual only.
+	rec := diag.NewRecorder()
+	rec.SetPersistPath(resolveDiagPath(*profileDir, *diagPathFlag))
+	probeSvc := adapter.New(probeAPI, probeStore)
+	probeCaps := func(ctx context.Context) {
+		rec.RunProbe(ctx, diag.ProbeAuth, probeAPI.ProbeConfig)
+		files, listErr := probeSvc.List(ctx, quarkapi.RootFID)
+		rec.RunProbe(ctx, diag.ProbeRootList, func(context.Context) error { return listErr })
+		var linkTarget string
+		if listErr == nil {
+			for _, f := range files {
+				if !f.IsDir() {
+					linkTarget = f.FID
+					break
+				}
+			}
+		}
+		if linkTarget == "" {
+			// Nothing in the root to mint a read link against: skipped, not
+			// failed — the precondition was absent, not the capability.
+			rec.RunProbe(ctx, diag.ProbeReadLink, nil)
+			return
+		}
+		rec.RunProbe(ctx, diag.ProbeReadLink, func(ctx context.Context) error {
+			_, err := probeSvc.DownloadURL(ctx, linkTarget)
+			return err
+		})
+	}
 	sup := supervisor.Supervise(ctx, supervisor.SupervisorConfig{
 		Port:           *port,
 		Cookie:         cookie,
@@ -576,6 +718,8 @@ func runMount(ctx context.Context, args []string) error {
 		CacheDir:       profileConfig.CacheDir,
 		StatePath:      statePath,
 		ReadyProbe:     probeAPI.ProbeConfig,
+		Recorder:       rec,
+		ProbeCaps:      probeCaps,
 	})
 	states := sup.Subscribe()
 	printDone := make(chan struct{})

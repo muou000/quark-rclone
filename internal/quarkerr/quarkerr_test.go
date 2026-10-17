@@ -3,6 +3,7 @@ package quarkerr
 import (
 	"errors"
 	"net/http"
+	"syscall"
 	"testing"
 )
 
@@ -142,5 +143,47 @@ func TestNotSupported(t *testing.T) {
 	}
 	if !Permanent(err) {
 		t.Fatal("operation_not_supported must be permanent")
+	}
+}
+
+// TestThreeWayMapping is the issue-22 contract table: every category maps to
+// one HTTP status and one errno, both decided here so the WebDAV endpoint and
+// the rclone/VFS layer can never drift apart. The ADR 0010 rows are explicit.
+func TestThreeWayMapping(t *testing.T) {
+	cases := []struct {
+		cat    Category
+		status int
+		errno  syscall.Errno
+	}{
+		{CatAuthRequired, http.StatusUnauthorized, syscall.EACCES},
+		{CatPermissionDenied, http.StatusForbidden, syscall.EACCES},
+		{CatObjectNotFound, http.StatusNotFound, syscall.ENOENT},
+		{CatParentNotFound, http.StatusNotFound, syscall.ENOENT},
+		{CatTargetConflict, http.StatusConflict, syscall.EEXIST},
+		{CatLocked, http.StatusLocked, syscall.EBUSY},
+		{CatNotSupported, http.StatusMethodNotAllowed, syscall.ENOSYS},
+		{CatRateLimited, http.StatusTooManyRequests, syscall.EAGAIN},
+		{CatUpstreamTransient, http.StatusBadGateway, syscall.EAGAIN},
+		{CatQuotaExceeded, http.StatusInsufficientStorage, syscall.ENOSPC},
+		{CatInvalidRequest, http.StatusBadRequest, syscall.EINVAL},
+		{CatCancelled, 499, syscall.EINTR},
+		{CatInternal, http.StatusBadGateway, syscall.EIO},
+		{CatUnknown, http.StatusBadGateway, syscall.EIO},
+	}
+	for _, tc := range cases {
+		if got := StatusCode(New(tc.cat, "", "")); got != tc.status {
+			t.Errorf("%s: StatusCode = %d, want %d", tc.cat, got, tc.status)
+		}
+		if got := Errno(tc.cat); got != tc.errno {
+			t.Errorf("%s: Errno = %v, want %v", tc.cat, got, tc.errno)
+		}
+		if got := ErrnoOf(New(tc.cat, "", "")); got != tc.errno {
+			t.Errorf("%s: ErrnoOf = %v, want %v", tc.cat, got, tc.errno)
+		}
+	}
+	// The fallback never fabricates a zero errno: an unclassified error must
+	// read as a failure, never as success.
+	if got := ErrnoOf(errors.New("plain")); got != syscall.EIO {
+		t.Errorf("ErrnoOf(plain) = %v, want EIO", got)
 	}
 }

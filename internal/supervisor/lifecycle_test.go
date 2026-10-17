@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -220,6 +221,45 @@ func TestStartupSequenceMountedAndCleanStop(t *testing.T) {
 	}
 	if launch.count() != 1 {
 		t.Fatalf("launches after stop = %d, want still 1", launch.count())
+	}
+}
+
+// TestProbeCapsRunAfterReadyAndBeforeLaunch pins the issue-22 probe ordering:
+// the capability probes run exactly once per attempt, after readiness
+// succeeded and before rclone is asked to mount, and a failing probe never
+// fails the mount.
+func TestProbeCapsRunAfterReadyAndBeforeLaunch(t *testing.T) {
+	probe := &probeSeq{seq: []bool{false, true}, fallback: false}
+	launch := &launcher{}
+	readyCalls := 0
+	launchSeq := 0
+	probeOrder := ""
+	var mu sync.Mutex
+	h := newHarness(t, func(c *SupervisorConfig) {
+		c.ProbeDrive = probe.probe
+		c.LaunchRclone = launch.do
+		c.ReadyProbe = func(context.Context) error {
+			mu.Lock()
+			readyCalls++
+			mu.Unlock()
+			return nil
+		}
+		c.ProbeCaps = func(context.Context) {
+			mu.Lock()
+			probeOrder = fmt.Sprintf("ready=%d launch=%d", readyCalls, launchSeq)
+			launchSeq++
+			mu.Unlock()
+		}
+	})
+
+	await(t, h, StateMounted, 5*time.Second)
+	if launch.count() != 1 {
+		t.Fatalf("launches = %d, want 1", launch.count())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if probeOrder != "ready=1 launch=0" {
+		t.Fatalf("probe order = %q, want the probe between ready and launch", probeOrder)
 	}
 }
 

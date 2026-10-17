@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/muou000/quark-rclone/internal/adapter"
+	"github.com/muou000/quark-rclone/internal/diag"
 	"golang.org/x/net/webdav"
 )
 
@@ -95,14 +96,18 @@ type FS struct {
 	rootFID  string
 	timeouts Timeouts
 	ttl      time.Duration
+	// recorder is the shared writeback ledger (issue #22). Supplied at
+	// construction; nil means recording is off.
+	recorder *diag.Recorder
 
 	mu   sync.Mutex
 	dirs map[string]*dirNode
 }
 
 // NewFS builds the filesystem adapter. A negative ttl keeps listings forever
-// (tests use it for determinism); a zero ttl re-fetches on every walk.
-func NewFS(svc *adapter.Service, rootFID string, timeouts Timeouts, ttl time.Duration) *FS {
+// (tests use it for determinism); a zero ttl re-fetches on every walk. A nil
+// recorder disables writeback recording.
+func NewFS(svc *adapter.Service, rootFID string, timeouts Timeouts, ttl time.Duration, recorder *diag.Recorder) *FS {
 	if rootFID == "" {
 		rootFID = "0"
 	}
@@ -111,6 +116,7 @@ func NewFS(svc *adapter.Service, rootFID string, timeouts Timeouts, ttl time.Dur
 		rootFID:  rootFID,
 		timeouts: timeouts.withDefaults(),
 		ttl:      ttl,
+		recorder: recorder,
 		dirs:     map[string]*dirNode{},
 	}
 }
@@ -226,6 +232,26 @@ func (f *FS) invalidateTree(dirPath string) {
 		}
 	}
 	f.mu.Unlock()
+}
+
+// recordWritebackFailure adds one refused writeback to the shared ledger
+// (issue #22, ADR 0010): the file stays visible, readable and writable, and
+// the ledger records the path, the retry count and the next retry time
+// instead of hiding or locking anything.
+func (f *FS) recordWritebackFailure(davPath string, err error) {
+	if f.recorder == nil {
+		return
+	}
+	f.recorder.RecordWritebackFailure(davPath, err.Error())
+}
+
+// resolveWriteback clears a path's ledger entry once its writeback went
+// through: the file must stop looking broken the moment it is not.
+func (f *FS) resolveWriteback(davPath string) {
+	if f.recorder == nil {
+		return
+	}
+	f.recorder.ResolveWriteback(davPath)
 }
 
 // Mkdir implements webdav.FileSystem. The handler refuses MKCOL on an
@@ -575,8 +601,13 @@ func (w *writeFile) Close() error {
 	}, w.spool, nil)
 	if err != nil {
 		w.record(err)
+		// The writeback the provider refused is the ledger's whole subject
+		// (issue #22): recorded with the file's DAV path so the tray can show
+		// which file is stuck, while the file itself stays untouched.
+		w.fs.recordWritebackFailure(w.davPath, err)
 		return err
 	}
+	w.fs.resolveWriteback(w.davPath)
 	w.fs.invalidateDir(path.Dir(w.davPath))
 	return nil
 }
