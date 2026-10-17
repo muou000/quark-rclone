@@ -396,9 +396,16 @@ func onReady(ctx context.Context, manager *trayui.Manager, panelURL string) {
 		}
 	}()
 
-	updates := manager.Subscribe()
+	// The menu binds to the pull model, not the lossy update stream: a burst
+	// of transitions during a restart drops the final Mounted update, and the
+	// menu would stay at 启动中 forever while the panel (a poller) showed the
+	// truth. One poll a second always converges on the same Snapshot the
+	// panel renders.
 	go func() {
-		for st := range updates {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		render := func() {
+			st := manager.Snapshot()
 			kind := trayui.KindOf(st.State)
 			systray.SetIcon(trayui.Icon(trayui.IconForState(kind)))
 			line := "夸克网盘挂载 — " + trayui.StateLabel(st.State)
@@ -407,6 +414,10 @@ func onReady(ctx context.Context, manager *trayui.Manager, panelURL string) {
 			}
 			systray.SetTooltip(line)
 			mStatus.SetTitle("状态：" + trayui.StateLabel(st.State))
+		}
+		render()
+		for range ticker.C {
+			render()
 		}
 	}()
 }

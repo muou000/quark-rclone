@@ -237,6 +237,11 @@ func TestPanelDataCarriesTheDocument(t *testing.T) {
 	if strings.Contains(string(body), "seed-cookie") || strings.Contains(string(body), "effective-cookie") {
 		t.Error("panel data must never carry a credential")
 	}
+	// A zero NextRetry must not marshal at all: a raw zero time rendered as
+	// 08:05:43 in UTC+8 on a Mounted panel.
+	if strings.Contains(string(body), "0001-01-01") {
+		t.Errorf("panel data carries a marshalled zero time: %s", body)
+	}
 }
 
 func TestShellHooksDriveAutostartAndUpgrade(t *testing.T) {

@@ -50,18 +50,21 @@ type PanelData struct {
 }
 
 // StatusView is the main panel's headline: Chinese state, remedy, and the
-// mount's identity.
+// mount's identity. NextRetry is a pointer so a zero value — no retry
+// pending — omits from the JSON entirely; omitempty is silent on struct
+// values, and a marshalled zero time rendered as "08:05:43" in UTC+8 on a
+// Mounted panel.
 type StatusView struct {
-	State       string    `json:"state"`
-	Label       string    `json:"label"`
-	Remedy      string    `json:"remedy"`
-	Phase       string    `json:"phase"`
-	Err         string    `json:"error,omitempty"`
-	Since       time.Time `json:"since"`
-	NextRetry   time.Time `json:"next_retry,omitempty"`
-	Permanent   bool      `json:"permanent"`
-	RootPath    string    `json:"root_path"`
-	NeedsReauth bool      `json:"needs_reauth"`
+	State       string     `json:"state"`
+	Label       string     `json:"label"`
+	Remedy      string     `json:"remedy"`
+	Phase       string     `json:"phase"`
+	Err         string     `json:"error,omitempty"`
+	Since       time.Time  `json:"since"`
+	NextRetry   *time.Time `json:"next_retry,omitempty"`
+	Permanent   bool       `json:"permanent"`
+	RootPath    string     `json:"root_path"`
+	NeedsReauth bool       `json:"needs_reauth"`
 }
 
 // TimelineView is one row of the recovery timeline.

@@ -152,6 +152,20 @@ func NewManager(
 // the full truth.
 func (m *Manager) Subscribe() <-chan supervisor.Status { return m.updates }
 
+// Snapshot is the current mount's status for pull-based surfaces: the tray
+// menu polls this every second, so a dropped stream update can never leave it
+// stale — the stream bursts exactly when a restart floods it, which is when
+// losing the final Mounted transition hurt (observed on a real remount: the
+// menu stayed at 启动中 while the panel correctly showed 已挂载).
+func (m *Manager) Snapshot() supervisor.Status {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.runner == nil {
+		return supervisor.Status{State: supervisor.StateDisabled, Since: time.Now()}
+	}
+	return m.runner.Status()
+}
+
 // CurrentOptions are the wizard's live choices.
 func (m *Manager) CurrentOptions() MountOptions {
 	m.mu.Lock()
@@ -461,6 +475,11 @@ func (m *Manager) Panel() PanelData {
 		data.CacheDir = runner.CacheDir()
 		data.MountPoint = runner.MountPoint()
 	}
+	var nextRetry *time.Time
+	if !st.NextRetry.IsZero() {
+		t := st.NextRetry
+		nextRetry = &t
+	}
 	data.Status = StatusView{
 		State:     string(st.State),
 		Label:     StateLabel(st.State),
@@ -468,7 +487,7 @@ func (m *Manager) Panel() PanelData {
 		Phase:     st.Phase,
 		Err:       st.Err,
 		Since:     st.Since,
-		NextRetry: st.NextRetry,
+		NextRetry: nextRetry,
 		// A paused state waits for the user; everything else recovers on its
 		// own. "临时错误"与"永久失败"在这里分家（issue #24, ADR 0010）。
 		Permanent:   st.State.Paused(),

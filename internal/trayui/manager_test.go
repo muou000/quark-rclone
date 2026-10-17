@@ -238,6 +238,22 @@ func TestFullRemountResetsRootClearsCacheAndRestarts(t *testing.T) {
 	}
 }
 
+// TestSnapshotMirrorsCurrentRunner pins the pull model the tray menu lives
+// on: with a runner up, Snapshot is its live status; with none, Disabled —
+// never a stale transition from a dead stream.
+func TestSnapshotMirrorsCurrentRunner(t *testing.T) {
+	h := newManagerHarness(t, MountOptions{Letter: "Q:", RootFID: "r1", RootPath: "/docs"})
+	if got := h.mgr.Snapshot().State; got != supervisor.StateDisabled {
+		t.Fatalf("Snapshot without runner = %s, want Disabled", got)
+	}
+	if err := h.mgr.Start(context.Background(), "seed-cookie"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if got := h.mgr.Snapshot().State; got != h.lastRunner().Status().State {
+		t.Fatalf("Snapshot = %s, want the live runner's %s", got, h.lastRunner().Status().State)
+	}
+}
+
 func TestApplyValidationFailureTouchesNothing(t *testing.T) {
 	h := newManagerHarness(t, MountOptions{Letter: "Q:", RootFID: "r1", RootPath: "/docs"})
 	if err := h.mgr.Start(context.Background(), "seed-cookie"); err != nil {
