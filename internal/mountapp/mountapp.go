@@ -11,6 +11,7 @@ package mountapp
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 
 	"github.com/muou000/quark-rclone/internal/adapter"
@@ -34,12 +35,11 @@ type Options struct {
 
 	// rclone child and its write path (issue #23). CacheRoot is the base the
 	// supervisor derives the instance cache directory from.
-	CacheMode      string
-	WriteBack      string
-	WriteChunkSize string
-	CacheRoot      string
-	RclonePath     string
-	BundleDir      string
+	CacheMode  string
+	WriteBack  string
+	CacheRoot  string
+	RclonePath string
+	BundleDir  string
 
 	// Behaviour.
 	StatePath string
@@ -57,6 +57,15 @@ type Options struct {
 func Start(ctx context.Context, o Options) (*supervisor.Supervisor, *diag.Recorder) {
 	rec := diag.NewRecorder()
 	rec.SetPersistPath(ResolveDiagPath(o.ProfileDir, o.DiagPath))
+
+	// The auto strategy's last gap: a profile that has never mounted has no
+	// recorded letter, and an empty mount point would make the supervisor's
+	// drive probe stat the process's own root and fake a conflict. Pick the
+	// first free letter here; recordLastLetter persists it for future boots.
+	mountPoint := o.MountPoint
+	if mountPoint == "" {
+		mountPoint = FirstFreeLetter(func(root string) error { _, err := os.Stat(root); return err })
+	}
 
 	// The probes run against a throwaway store: a probe must never persist a
 	// cookie rotation, that is the live session's job.
@@ -93,21 +102,20 @@ func Start(ctx context.Context, o Options) (*supervisor.Supervisor, *diag.Record
 	}
 
 	sup := supervisor.Supervise(ctx, supervisor.SupervisorConfig{
-		Port:           o.Port,
-		Cookie:         o.Cookie,
-		Persist:        o.Persist,
-		RootFID:        o.RootFID,
-		BundleDir:      o.BundleDir,
-		RclonePath:     o.RclonePath,
-		MountPoint:     o.MountPoint,
-		CacheMode:      o.CacheMode,
-		WriteBack:      o.WriteBack,
-		WriteChunkSize: o.WriteChunkSize,
-		CacheRoot:      o.CacheRoot,
-		StatePath:      o.StatePath,
-		ReadyProbe:     probeAPI.ProbeConfig,
-		Recorder:       rec,
-		ProbeCaps:      probeCaps,
+		Port:       o.Port,
+		Cookie:     o.Cookie,
+		Persist:    o.Persist,
+		RootFID:    o.RootFID,
+		BundleDir:  o.BundleDir,
+		RclonePath: o.RclonePath,
+		MountPoint: mountPoint,
+		CacheMode:  o.CacheMode,
+		WriteBack:  o.WriteBack,
+		CacheRoot:  o.CacheRoot,
+		StatePath:  o.StatePath,
+		ReadyProbe: probeAPI.ProbeConfig,
+		Recorder:   rec,
+		ProbeCaps:  probeCaps,
 	})
 	return sup, rec
 }
@@ -140,6 +148,23 @@ func ResolveCacheRoot(profileDir, explicit string) string {
 	}
 	if profileDir != "" {
 		return filepath.Join(profileDir, "cache")
+	}
+	return ""
+}
+
+// FirstFreeLetter scans D: through Z: and returns the first letter with no
+// volume behind it — the auto strategy's pick for a profile that has never
+// mounted (ADR 0005). C: is skipped: the system and page-file volumes live
+// there and a mount there can never succeed. stat is injected for tests and
+// is os.Stat in production; an error means the root is absent, so the letter
+// is free. An empty result means every candidate was taken — the caller hands
+// the empty string on and the supervisor's drive probe names the collision.
+func FirstFreeLetter(stat func(string) error) string {
+	for l := byte('D'); l <= 'Z'; l++ {
+		root := string(l) + `:\`
+		if stat(root) != nil {
+			return string(l) + ":"
+		}
 	}
 	return ""
 }

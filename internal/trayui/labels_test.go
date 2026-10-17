@@ -84,3 +84,20 @@ func TestUnsupportedNoticeNamesBothGaps(t *testing.T) {
 		}
 	}
 }
+
+// preflightChecks is the closed set of gate names preflight.Finding.Check
+// declares (plus the panel's own unavailable answer); the label test iterates
+// it so a new gate without a Chinese label fails loudly.
+var preflightChecks = []string{"platform", "rclone", "winfsp", "mount", "preflight"}
+
+func TestEveryPreflightCheckHasChineseLabel(t *testing.T) {
+	for _, check := range preflightChecks {
+		if label := PreflightCheckLabel(check); label == "" || label == check {
+			t.Errorf("PreflightCheckLabel(%s) = %q, want a Chinese label", check, label)
+		}
+	}
+	// An unknown gate falls back to the raw name instead of an empty cell.
+	if got := PreflightCheckLabel("something-new"); got != "something-new" {
+		t.Errorf("PreflightCheckLabel(unknown) = %q, want the raw name", got)
+	}
+}

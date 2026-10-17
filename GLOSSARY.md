@@ -54,6 +54,10 @@ _Avoid_: sync, mirror, downloaded copy
 The process or embedded component that translates Windows filesystem requests into Quark file operations.
 _Avoid_: WebDAV server, synchronizer
 
+**Runtime pre-check**:
+The pre-mount gate that verifies the platform, the bundled rclone (version and SHA-256 manifest) and the WinFsp driver before any mount starts, each failure carrying a repair path.
+_Avoid_: doctor output, self-repair, environment fix
+
 **Operation capability**:
 The currently supported set of file operations for the account and mount, such as list, read, write, move, rename, or delete.
 _Avoid_: permission, feature flag

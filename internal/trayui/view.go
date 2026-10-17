@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/muou000/quark-rclone/internal/diag"
+	"github.com/muou000/quark-rclone/internal/preflight"
 )
 
 // PanelData is the whole main-panel payload (issue #24): one JSON document
@@ -70,6 +71,40 @@ type TimelineView struct {
 	Phase string    `json:"phase"`
 	Err   string    `json:"error,omitempty"`
 	Since time.Time `json:"since"`
+}
+
+// PreflightFindingView is one gate's outcome in the setup tab's preflight
+// card: the same checks quark-adapter doctor runs, rendered for the panel.
+// Label is the closed-set Chinese gate name, filled server-side (ADR 0012:
+// labels live in trayui, not in the page).
+type PreflightFindingView struct {
+	Check  string `json:"check"`
+	Label  string `json:"label"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail"`
+}
+
+// PreflightView is the whole runtime pre-check report behind the setup
+// wizard's gate: a failing gate locks the wizard and shows its Chinese
+// remedy; an all-green report unlocks the cookie form.
+type PreflightView struct {
+	OK       bool                   `json:"ok"`
+	Status   string                 `json:"status"`
+	Findings []PreflightFindingView `json:"findings"`
+}
+
+// PreflightReportView maps the preflight package's report onto the panel's
+// view types. The panel runs the static gates only — no mount self-test,
+// which would attempt a real mount against the letter the panel's own tray
+// may already hold.
+func PreflightReportView(rep *preflight.Report) PreflightView {
+	v := PreflightView{OK: rep.OK(), Status: string(rep.Status)}
+	for _, f := range rep.Findings {
+		v.Findings = append(v.Findings, PreflightFindingView{
+			Check: f.Check, Label: PreflightCheckLabel(f.Check), OK: f.OK, Detail: f.Detail,
+		})
+	}
+	return v
 }
 
 // WritebackView is one row of the dirty-cache ledger, with the category a

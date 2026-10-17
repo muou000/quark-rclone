@@ -322,3 +322,154 @@ func TestNilHooksAnswerHonestly(t *testing.T) {
 		}
 	}
 }
+
+func TestPreflightEndpointCarriesHookReport(t *testing.T) {
+	h := newManagerHarness(t, MountOptions{})
+	calls := 0
+	s := NewServer(h.mgr, "panel-token-123").WithHooks(Hooks{
+		Preflight: func(ctx context.Context) PreflightView {
+			calls++
+			return PreflightView{
+				OK:     false,
+				Status: "winfsp_required",
+				Findings: []PreflightFindingView{
+					{Check: "platform", OK: true, Detail: "平台 windows/amd64 在首版验证范围内。"},
+					{Check: "winfsp", OK: false, Detail: "未检测到 WinFsp：请安装 WinFsp x64 2.0 或更高版本。"},
+				},
+			}
+		},
+	})
+
+	// A read-only GET like /api/panel: no token guard, loopback only.
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	resp, err := http.Get(srv.URL + "/api/preflight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var got PreflightView
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("preflight response: %v (%s)", err, body)
+	}
+	if got.OK || got.Status != "winfsp_required" || len(got.Findings) != 2 || got.Findings[1].OK {
+		t.Fatalf("preflight = %s", body)
+	}
+	if calls != 1 {
+		t.Errorf("preflight hook calls = %d, want 1", calls)
+	}
+
+	// An all-green report is what unlocks the wizard on the page.
+	s2 := NewServer(h.mgr, "panel-token-123").WithHooks(Hooks{
+		Preflight: func(ctx context.Context) PreflightView {
+			return PreflightView{OK: true, Status: "ok", Findings: []PreflightFindingView{
+				{Check: "platform", OK: true, Detail: "通过"},
+			}}
+		},
+	})
+	srv2 := httptest.NewServer(s2.Handler())
+	t.Cleanup(srv2.Close)
+	resp, err = http.Get(srv2.URL + "/api/preflight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `"ok":true`) {
+		t.Errorf("green preflight = %s", body)
+	}
+}
+
+func TestPreflightWithoutHookAnswersHonestly(t *testing.T) {
+	h := newManagerHarness(t, MountOptions{})
+	s := NewServer(h.mgr, "panel-token-123")
+
+	resp, err := http.Get(httptest.NewServer(s.Handler()).URL + "/api/preflight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `"ok":false`) || !strings.Contains(string(body), "unavailable") {
+		t.Errorf("preflight without hook = %s, want an honest refusal", body)
+	}
+}
+
+// TestApplySurvivesRequestDisconnection pins the lifecycle-context contract:
+// the wizard's HTTP request ends the moment its answer is written, but the
+// mount it just started must live on. A request-scoped context reaching the
+// supervisor killed every panel-applied mount the instant the page saw
+// "已应用，挂载重启中…" (observed on a real first-run: apply → Disabled in
+// the same second).
+func TestRemountIsGuardedAndResets(t *testing.T) {
+	h := newManagerHarness(t, MountOptions{Letter: "Q:", RootFID: "r1", RootPath: "/docs"})
+	if err := h.mgr.Start(context.Background(), "seed-cookie"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	s := NewServer(h.mgr, "panel-token-123")
+
+	// Guarded like every mutation.
+	resp := postJSON(t, s.Handler(), "/api/remount", "", "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized remount = %d, want 401", resp.StatusCode)
+	}
+
+	// With the token the reset runs: root back to the whole drive.
+	resp = postJSON(t, s.Handler(), "/api/remount", "panel-token-123", "")
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `"ok":true`) {
+		t.Fatalf("remount = %s", body)
+	}
+	got := h.savedCfg[len(h.savedCfg)-1]
+	if got.RootFID != "0" || got.RootPath != "/" || got.Letter != "Q:" {
+		t.Errorf("remount saved = %+v, want root 0// with the letter kept", got)
+	}
+}
+
+func TestApplySurvivesRequestDisconnection(t *testing.T) {
+	h := newManagerHarness(t, MountOptions{Letter: "Q:", RootFID: "r1", RootPath: "/docs"})
+	s := NewServer(h.mgr, "panel-token-123")
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("POST", "/api/apply", strings.NewReader(`{"cookie":"good","letter":"Q"}`)).WithContext(reqCtx)
+	req.Header.Set("X-Panel-Token", "panel-token-123")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `"ok":true`) {
+		t.Fatalf("apply = %s", body)
+	}
+
+	// The client goes away right after the answer, as browsers do.
+	cancel()
+
+	if len(h.startCtxs) != 1 {
+		t.Fatalf("starts = %d, want 1", len(h.startCtxs))
+	}
+	select {
+	case <-h.startCtxs[0].Done():
+		t.Fatal("the started mount's context died with the HTTP request")
+	default:
+	}
+
+	// Reauth shares the contract.
+	h2 := newManagerHarness(t, MountOptions{Letter: "Q:", RootFID: "r1", RootPath: "/docs"})
+	s2 := NewServer(h2.mgr, "panel-token-123")
+	reqCtx2, cancel2 := context.WithCancel(context.Background())
+	req2 := httptest.NewRequest("POST", "/api/reauth", strings.NewReader(`{"cookie":"good"}`)).WithContext(reqCtx2)
+	req2.Header.Set("X-Panel-Token", "panel-token-123")
+	w2 := httptest.NewRecorder()
+	s2.Handler().ServeHTTP(w2, req2)
+	w2.Result().Body.Close()
+	cancel2()
+	select {
+	case <-h2.startCtxs[0].Done():
+		t.Fatal("the reauth restart's context died with the HTTP request")
+	default:
+	}
+}

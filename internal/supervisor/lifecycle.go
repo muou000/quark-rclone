@@ -27,12 +27,11 @@ type SupervisorConfig struct {
 
 	// rclone child process. An empty RclonePath means the bundled
 	// RcloneExeName inside BundleDir.
-	BundleDir      string
-	RclonePath     string
-	MountPoint     string
-	CacheMode      string
-	WriteBack      string
-	WriteChunkSize string
+	BundleDir  string
+	RclonePath string
+	MountPoint string
+	CacheMode  string
+	WriteBack  string
 	// CacheRoot is the base directory under which this mount instance keeps
 	// its own cache directory (issue #23, ADR 0002/0005). The instance
 	// directory <CacheRoot>/<mount-point key> is exclusive to this mount —
@@ -563,9 +562,6 @@ func (s *Supervisor) rcloneArgs(configPath string) []string {
 	if s.cfg.WriteBack != "" {
 		args = append(args, "--vfs-write-back", s.cfg.WriteBack)
 	}
-	if s.cfg.WriteChunkSize != "" {
-		args = append(args, "--vfs-write-chunk-size", s.cfg.WriteChunkSize)
-	}
 	return args
 }
 
@@ -687,11 +683,40 @@ func (s *Supervisor) classifyFarSide(phase string, err error) State {
 	return StateWaitingForNetwork
 }
 
-// classifyMountDeath sorts an early mount death the same way, and always
-// tears the dead process down first so no instance survives.
+// classifyMountDeath sorts an early mount death and always tears the dead
+// process down first so no instance survives. A command-line rejection is
+// deterministic — the same invocation would fail again on every retry — so
+// it lands in Failed and waits for a human instead of looping on the network
+// schedule.
 func (s *Supervisor) classifyMountDeath() State {
 	s.teardownRclone()
+	if isRcloneUsageError(s.rcloneExitText) {
+		s.transition(StateFailed, "rclone", s.rcloneExitText)
+		return StateFailed
+	}
 	return s.classifyFarSide("rclone", errors.New(s.rcloneExitText))
+}
+
+// isRcloneUsageError reports whether rclone rejected its own command line.
+// The markers come from rclone's flag parser and the usage banner it prints
+// on every parse failure; all of them mean the invocation itself is wrong,
+// and no network wait can fix it. Deliberately narrower than the wording
+// heuristics in preflight.ClassifyMountFailure: only deterministic parse
+// failures may park a mount in Failed, everything else keeps retrying.
+func isRcloneUsageError(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range []string{
+		"unknown flag",
+		"flag provided but not defined",
+		"flag needs an argument",
+		"unknown command",
+		"usage:",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // errText renders an error for classification and reporting; a nil error is

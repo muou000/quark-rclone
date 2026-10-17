@@ -772,20 +772,19 @@ func runMount(ctx context.Context, args []string) error {
 		cacheProfileDir = profileStore.Dir()
 	}
 	sup, rec := mountapp.Start(ctx, mountapp.Options{
-		Port:           *port,
-		Cookie:         cookie,
-		Persist:        persist,
-		RootFID:        profileConfig.Quark.RootFID,
-		MountPoint:     *mountPoint,
-		CacheMode:      profileConfig.Writes.CacheMode,
-		WriteBack:      profileConfig.Writes.WriteBack,
-		WriteChunkSize: profileConfig.Writes.WriteChunkSize,
-		CacheRoot:      mountapp.ResolveCacheRoot(cacheProfileDir, profileConfig.CacheDir),
-		RclonePath:     *rclone,
-		BundleDir:      bundleDirForGate,
-		StatePath:      statePath,
-		ProfileDir:     *profileDir,
-		DiagPath:       *diagPathFlag,
+		Port:       *port,
+		Cookie:     cookie,
+		Persist:    persist,
+		RootFID:    profileConfig.Quark.RootFID,
+		MountPoint: *mountPoint,
+		CacheMode:  profileConfig.Writes.CacheMode,
+		WriteBack:  profileConfig.Writes.WriteBack,
+		CacheRoot:  mountapp.ResolveCacheRoot(cacheProfileDir, profileConfig.CacheDir),
+		RclonePath: *rclone,
+		BundleDir:  bundleDirForGate,
+		StatePath:  statePath,
+		ProfileDir: *profileDir,
+		DiagPath:   *diagPathFlag,
 	})
 	states := sup.Subscribe()
 	// The cache location is part of the write contract (issue #23): the user

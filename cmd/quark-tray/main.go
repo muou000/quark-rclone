@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -65,14 +66,17 @@ func run() error {
 	}
 
 	// The single-instance guard (issue #25, AC 5): two tray instances of any
-	// version must never hold the same drive letter or cache directory. The
-	// guard is released at exit; a second launch exits here with a remedy.
+	// version must never hold the same drive letter or cache directory. A
+	// second launch is not an error the user should suffer silently, though:
+	// it surfaces the running instance's panel in the browser, which is what
+	// a double-click on the exe is asking for.
 	releaseGuard, alreadyRunning, err := singleinstance.Acquire(singleinstance.DefaultName)
 	if err != nil {
 		return err
 	}
 	if alreadyRunning {
-		return errors.New("夸克网盘挂载已在运行：请从托盘图标操作，勿重复启动")
+		openRunningPanel(*profileDir)
+		return nil
 	}
 	defer releaseGuard()
 
@@ -140,9 +144,16 @@ func run() error {
 				return v
 			},
 			Upgrade: func(ctx context.Context) error { return applyUpgrade(ctx, manager, upg, log) },
+			Preflight: func(ctx context.Context) trayui.PreflightView {
+				return trayui.PreflightReportView(preflight.Run(ctx, preflight.Options{BundleDir: preflight.DefaultBundleDir()}))
+			},
 		}).Handler()}
 	go func() { _ = srv.Serve(listener) }()
 	log.Add("主面板就绪：%s", panelURL)
+	if err := writePanelDiscovery(store.Dir(), panelURL); err != nil {
+		log.Add("面板发现文件写入失败（二次启动将无法自动打开面板）：%v", err)
+	}
+	defer removePanelDiscovery(store.Dir())
 
 	// System lifecycle events (issue #25): a resume re-runs the mount's whole
 	// check chain, and a logoff/shutdown gets the orderly teardown before the
@@ -248,18 +259,17 @@ func startFunc(store *profile.Store, cfg profile.Config, port int) func(context.
 			rootFID = cfg.Quark.RootFID
 		}
 		sup, rec := mountapp.Start(ctx, mountapp.Options{
-			Port:           port,
-			Cookie:         effective,
-			Persist:        func(c string) { _ = store.SaveCookie(c) },
-			RootFID:        rootFID,
-			MountPoint:     mountPoint,
-			CacheMode:      cfg.Writes.CacheMode,
-			WriteBack:      cfg.Writes.WriteBack,
-			WriteChunkSize: cfg.Writes.WriteChunkSize,
-			CacheRoot:      mountapp.ResolveCacheRoot(store.Dir(), cfg.CacheDir),
-			BundleDir:      preflight.DefaultBundleDir(),
-			StatePath:      filepath.Join(store.Dir(), "state.json"),
-			ProfileDir:     store.Dir(),
+			Port:       port,
+			Cookie:     effective,
+			Persist:    func(c string) { _ = store.SaveCookie(c) },
+			RootFID:    rootFID,
+			MountPoint: mountPoint,
+			CacheMode:  cfg.Writes.CacheMode,
+			WriteBack:  cfg.Writes.WriteBack,
+			CacheRoot:  mountapp.ResolveCacheRoot(store.Dir(), cfg.CacheDir),
+			BundleDir:  preflight.DefaultBundleDir(),
+			StatePath:  filepath.Join(store.Dir(), "state.json"),
+			ProfileDir: store.Dir(),
 		})
 		return runnerAdapter{sup}, rec, nil
 	}
@@ -453,6 +463,94 @@ func newPanelToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+// panelDiscoveryName is the file the running tray writes beside the profile
+// so a second launch can surface the live panel instead of dying silently.
+const panelDiscoveryName = "panel.json"
+
+// panelDiscovery is the discovery file's shape: the running panel's URL —
+// token included, because that is what a browser needs to actually use the
+// panel. The token guards the panel against *other* local users (ADR 0012);
+// the file lives in the same per-user profile directory, inside the boundary
+// ADR 0012 already draws: the user session itself. Freshness needs no
+// timestamp — the file only exists while its process runs, and the reader
+// probes liveness anyway (a crashed instance's leftover file must not open a
+// dead page).
+type panelDiscovery struct {
+	URL string `json:"url"`
+}
+
+// writePanelDiscovery records the running panel's URL. Failures are logged
+// by the caller and degrade to the tray-icon-only path; they never block
+// startup.
+func writePanelDiscovery(dir, panelURL string) error {
+	data, err := json.Marshal(panelDiscovery{URL: panelURL})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, panelDiscoveryName), data, 0o600)
+}
+
+// removePanelDiscovery deletes the discovery file. A stale file is harmless —
+// the second-launch path probes liveness — but pointless to keep.
+func removePanelDiscovery(dir string) {
+	_ = os.Remove(filepath.Join(dir, panelDiscoveryName))
+}
+
+// readPanelDiscovery returns the recorded panel URL, or "" when the file is
+// absent, malformed, or not a loopback address.
+func readPanelDiscovery(dir string) string {
+	data, err := os.ReadFile(filepath.Join(dir, panelDiscoveryName))
+	if err != nil {
+		return ""
+	}
+	var d panelDiscovery
+	if json.Unmarshal(data, &d) != nil {
+		return ""
+	}
+	if !strings.HasPrefix(d.URL, "http://127.0.0.1:") {
+		return ""
+	}
+	return d.URL
+}
+
+// probePanel reports whether the panel at url answers. Any HTTP response —
+// even a 401 — proves a live tray on the other end, so a stale discovery
+// file left by a crashed instance never opens a dead page.
+func probePanel(url string) bool {
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	resp, err := client.Get(url)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return true
+}
+
+// openRunningPanel is the second-launch path: a double-click on the exe while
+// the tray runs asks for the panel, and it gets exactly that. Without a live,
+// recorded panel the remedy names the tray icon — the console output here is
+// best-effort, visible only when launched from a terminal.
+func openRunningPanel(profileDir string) {
+	dir := profileDir
+	if dir == "" {
+		var err error
+		if dir, err = profile.DefaultDir(); err != nil {
+			fmt.Fprintln(os.Stderr, "夸克网盘挂载已在运行：请从托盘图标打开主面板")
+			return
+		}
+	}
+	url := readPanelDiscovery(dir)
+	if url == "" || !probePanel(url) {
+		fmt.Fprintln(os.Stderr, "夸克网盘挂载已在运行：请从托盘图标（右下角）打开主面板")
+		return
+	}
+	if err := exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "夸克网盘挂载已在运行：打开主面板失败（%v），请从托盘图标打开\n", err)
+		return
+	}
+	fmt.Fprintln(os.Stderr, "夸克网盘挂载已在运行：已在浏览器打开主面板")
 }
 
 // openProfileStore resolves the profile directory and opens the store.

@@ -168,9 +168,6 @@ func migrateV0(raw json.RawMessage) (Config, error) {
 	if v0.Writes.WriteBack == "" {
 		v0.Writes.WriteBack = def.Writes.WriteBack
 	}
-	if v0.Writes.WriteChunkSize == "" {
-		v0.Writes.WriteChunkSize = def.Writes.WriteChunkSize
-	}
 	if v0.Network.Mode == "" {
 		v0.Network.Mode = def.Network.Mode
 	}

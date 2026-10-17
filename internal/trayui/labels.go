@@ -116,6 +116,26 @@ func CategoryIsPermanent(c quarkerr.Category) bool {
 	return quarkerr.Permanent(quarkerr.New(c, "", ""))
 }
 
+// PreflightCheckLabel renders a preflight gate's name in Chinese. The set is
+// closed over preflight.go's Finding.Check values (plus the panel's own
+// unavailable answer); a gate without a label is a bug the label test catches
+// the moment a new one is added.
+func PreflightCheckLabel(check string) string {
+	switch check {
+	case "platform":
+		return "平台"
+	case "rclone":
+		return "随包 rclone"
+	case "winfsp":
+		return "WinFsp 驱动"
+	case "mount":
+		return "挂载自检"
+	case "preflight":
+		return "预检"
+	}
+	return check
+}
+
 // UnsupportedNotice is the fixed statement the panel shows for the
 // capabilities the backend does not have. It names the limitation as a
 // permanent property of Quark, not as a fault of the mount.

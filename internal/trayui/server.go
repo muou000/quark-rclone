@@ -36,6 +36,9 @@ type Hooks struct {
 	// Upgrade applies the staged upgrade: the caller stops the mount first
 	// and restarts it afterwards (ADR 0006's order).
 	Upgrade func(ctx context.Context) error
+	// Preflight runs the runtime pre-check (the doctor chain) in-process and
+	// returns its report for the setup tab's gate. Nil answers honestly.
+	Preflight func(ctx context.Context) PreflightView
 }
 
 // Server serves the tray's local panel: the embedded page, the panel data
@@ -70,11 +73,13 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.servePanel)
 	mux.HandleFunc("GET /api/panel", s.servePanelData)
+	mux.HandleFunc("GET /api/preflight", s.servePreflight)
 	mux.HandleFunc("GET /api/log", s.serveLogExport)
 	mux.HandleFunc("POST /api/validate", s.guard(s.serveValidate))
 	mux.HandleFunc("POST /api/apply", s.guard(s.serveApply))
 	mux.HandleFunc("POST /api/reauth", s.guard(s.serveReauth))
 	mux.HandleFunc("POST /api/recheck", s.guard(s.serveRecheck))
+	mux.HandleFunc("POST /api/remount", s.guard(s.serveRemount))
 	mux.HandleFunc("POST /api/autostart", s.guard(s.serveAutostart))
 	mux.HandleFunc("POST /api/upgrade", s.guard(s.serveUpgrade))
 	return mux
@@ -113,6 +118,23 @@ func (s *Server) servePanelData(w http.ResponseWriter, r *http.Request) {
 		data.UpgradeVersion = s.hooks.StagedVersion()
 	}
 	writeJSON(w, data)
+}
+
+// servePreflight answers the setup tab's gate: the doctor chain's static
+// gates (platform, bundled rclone, WinFsp) run in-process — the mount
+// self-test is deliberately absent, since a real mount attempt cannot run
+// against the letter this very tray may already hold. A read-only GET like
+// /api/panel, so the token guard does not apply; nothing here can drive the
+// mount.
+func (s *Server) servePreflight(w http.ResponseWriter, r *http.Request) {
+	if s.hooks.Preflight == nil {
+		writeJSON(w, PreflightView{OK: false, Status: "unavailable", Findings: []PreflightFindingView{{
+			Check: "preflight", OK: false,
+			Detail: "此构建不支持内置预检：请使用 quark-adapter doctor 查看运行环境。",
+		}}})
+		return
+	}
+	writeJSON(w, s.hooks.Preflight(r.Context()))
 }
 
 // serveLogExport streams the redacted event log as a text file (AC 4).
@@ -161,13 +183,17 @@ func (s *Server) serveValidate(w http.ResponseWriter, r *http.Request) {
 
 // serveApply runs the full first-run configuration: validate, persist
 // credential, save root/drive choices, restart. Validation failure leaves
-// every durable store untouched (AC 2).
+// every durable store untouched (AC 2). The lifecycle work is detached from
+// the HTTP request — the same contract as recheck: the handler answers
+// "已应用，挂载重启中…" and returns, and the mount it just started must not
+// die with the request's context.
 func (s *Server) serveApply(w http.ResponseWriter, r *http.Request) {
+	ctx := context.WithoutCancel(r.Context())
 	req, ok := decodeWizard(w, r)
 	if !ok {
 		return
 	}
-	err := s.mgr.Apply(r.Context(), req.Cookie, MountOptions{
+	err := s.mgr.Apply(ctx, req.Cookie, MountOptions{
 		Letter:   req.Letter,
 		RootFID:  req.RootFID,
 		RootPath: req.RootPath,
@@ -177,13 +203,15 @@ func (s *Server) serveApply(w http.ResponseWriter, r *http.Request) {
 
 // serveReauth is the NeedsReauth path (AC 3): validate the new cookie,
 // persist it, restart — with no options touched, so root, drive letter,
-// profile and dirty cache survive as they are.
+// profile and dirty cache survive as they are. The restart outlives the
+// request, so its context is detached like apply's.
 func (s *Server) serveReauth(w http.ResponseWriter, r *http.Request) {
+	ctx := context.WithoutCancel(r.Context())
 	req, ok := decodeWizard(w, r)
 	if !ok {
 		return
 	}
-	err := s.mgr.Apply(r.Context(), req.Cookie, MountOptions{})
+	err := s.mgr.Apply(ctx, req.Cookie, MountOptions{})
 	applyResult(w, err)
 }
 
@@ -194,6 +222,18 @@ func (s *Server) serveReauth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveRecheck(w http.ResponseWriter, r *http.Request) {
 	ctx := context.WithoutCancel(r.Context())
 	if err := s.mgr.Recheck(ctx); err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// serveRemount is the one-click reset: stop, clear the instance's VFS cache,
+// reset the root to the whole drive and restart from the stored credential.
+// The restart outlives the request, so its context is detached like apply's.
+func (s *Server) serveRemount(w http.ResponseWriter, r *http.Request) {
+	ctx := context.WithoutCancel(r.Context())
+	if err := s.mgr.FullRemount(ctx); err != nil {
 		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
