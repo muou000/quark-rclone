@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -74,8 +75,6 @@ type Server struct {
 	http     *http.Server
 	ln       net.Listener
 	cdclient *http.Client
-
-	startOnce sync.Once
 }
 
 // New builds a Server. Call Listen before Serve.
@@ -178,9 +177,7 @@ func (s *Server) Close() error { return s.http.Close() }
 // surface second.
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			w.Header().Set("Allow", "GET, HEAD")
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		if !requireMethod(w, r, http.MethodGet, http.MethodHead) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -190,9 +187,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/capabilities" {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			w.Header().Set("Allow", "GET, HEAD")
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		if !requireMethod(w, r, http.MethodGet, http.MethodHead) {
 			return
 		}
 		s.serveCapabilities(w)
@@ -203,6 +198,19 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.serveDav(w, r)
+}
+
+// requireMethod answers 405 with an Allow header unless the request method is
+// one of the allowed ones.
+func requireMethod(w http.ResponseWriter, r *http.Request, allowed ...string) bool {
+	for _, m := range allowed {
+		if r.Method == m {
+			return true
+		}
+	}
+	w.Header().Set("Allow", strings.Join(allowed, ", "))
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	return false
 }
 
 // serveCapabilities reports the backend capability statement plus the DAV
@@ -255,20 +263,37 @@ func (s *Server) cookieOK(r *http.Request) bool {
 	if got == "" || s.cfg.Cookie == "" {
 		return false
 	}
-	return subtleCompare(got, s.cfg.Cookie)
+	return subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.Cookie)) == 1
 }
 
 // servePut runs the webdav handler with the response buffered so a real
 // upload failure can rewrite the generic 405 the handler maps Close errors
 // to, into the provider's category status — 409 for a name conflict, 502-class
 // for transient upstream failures that rclone should retry.
+//
+// The read deadline bounds the body-receive phase (issue #18's explicit
+// read timeout): a client that stops sending mid-body cannot park the
+// connection forever. The spool→upload phase is bounded separately by the
+// filesystem's upload timeout.
 func (s *Server) servePut(w http.ResponseWriter, r *http.Request) {
 	holder := &uploadErrHolder{}
 	rw := &bufferedResponse{ResponseWriter: w}
+	if s.cfg.Timeouts.Upload > 0 {
+		if rc := http.NewResponseController(rw); rc != nil {
+			_ = rc.SetReadDeadline(time.Now().Add(s.cfg.Timeouts.Upload))
+		}
+	}
 	s.handler.ServeHTTP(rw, r.WithContext(context.WithValue(r.Context(), uploadErrKey{}, holder)))
 	status, body := rw.render()
 	if err := holder.get(); err != nil && status >= 400 {
 		status = quarkerr.StatusCode(err)
+		body = statusText(status)
+	} else if status >= 400 && r.Context().Err() != nil {
+		// The body died mid-transfer — a stalled client cut off by the read
+		// deadline, or a hangup. No provider category exists for it, but the
+		// handler's 405 would lie about the method, so answer the retryable
+		// gateway error the mount client should react to.
+		status = http.StatusBadGateway
 		body = statusText(status)
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -402,18 +427,6 @@ func (h *uploadErrHolder) get() error {
 	return h.err
 }
 
-// subtleCompare is a constant-time string equality for bearer-style secrets.
-func subtleCompare(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var v byte
-	for i := 0; i < len(a); i++ {
-		v |= a[i] ^ b[i]
-	}
-	return v == 0
-}
-
 // bufferedResponse buffers one handler response so the PUT status fixer can
 // substitute the status after the webdav handler returned. Only PUT uses it,
 // and a PUT response body is at most the handler's static status text, so the
@@ -424,6 +437,10 @@ type bufferedResponse struct {
 	body   strings.Builder
 	header http.Header
 }
+
+// Unwrap lets http.NewResponseController reach the real writer for read
+// deadlines.
+func (b *bufferedResponse) Unwrap() http.ResponseWriter { return b.ResponseWriter }
 
 func (b *bufferedResponse) Header() http.Header {
 	if b.header == nil {

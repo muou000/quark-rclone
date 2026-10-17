@@ -3,7 +3,9 @@ package dav
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -575,6 +577,69 @@ func TestPutUploadsThroughAndInvalidates(t *testing.T) {
 	resp, body := davReq(t, "PROPFIND", s.url(t, "/"), "", map[string]string{"Depth": "1"})
 	if resp.StatusCode != http.StatusMultiStatus || !strings.Contains(body, "new.txt") {
 		t.Fatalf("propfind after put = %d, listing stale: %s", resp.StatusCode, body)
+	}
+}
+
+// TestPutPartialBodyIsNeverUploaded pins the safety guard: a PUT whose body
+// never arrived completely — the client walked away mid-transfer — must not
+// upload the partial spool to the provider. A partial file with a live FID
+// would look like a real object in the drive.
+func TestPutPartialBodyIsNeverUploaded(t *testing.T) {
+	f := newFakeDrive(t)
+	s := f.startServer(t, nil)
+
+	// Send headers promising 100 bytes, deliver 2, then hang up.
+	conn, err := net.Dial("tcp", s.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(conn, "PUT /dav/partial.txt HTTP/1.1\r\nHost: %s\r\nCookie: session-cookie\r\nContent-Length: 100\r\n\r\n", s.Addr())
+	_, _ = conn.Write([]byte("xx"))
+	_ = conn.Close()
+
+	// The server notices the abort and must refuse the upload.
+	deadline := time.After(3 * time.Second)
+	for {
+		if _, _, _, _, _, finish := f.counts(); finish == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("a partial body was uploaded")
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// TestPutBodyReceiveTimeout checks the read deadline on the PUT phase: a
+// client that stalls mid-body gets cut off instead of parking the connection
+// forever.
+func TestPutBodyReceiveTimeout(t *testing.T) {
+	f := newFakeDrive(t)
+	s := f.startServer(t, func(c *Config) {
+		c.Timeouts.Upload = 300 * time.Millisecond
+	})
+
+	conn, err := net.Dial("tcp", s.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "PUT /dav/stalled.txt HTTP/1.1\r\nHost: %s\r\nCookie: session-cookie\r\nContent-Length: 100\r\n\r\n", s.Addr())
+	_, _ = conn.Write([]byte("xx"))
+
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("no response after the body deadline: %v", err)
+	}
+	status := string(buf[:n])
+	if !strings.HasPrefix(status, "HTTP/1.1 5") && !strings.HasPrefix(status, "HTTP/1.0 5") {
+		t.Fatalf("response = %q, want a 5xx cut-off", status)
+	}
+	if _, _, _, _, _, finish := f.counts(); finish != 0 {
+		t.Fatal("a stalled body was uploaded")
 	}
 }
 

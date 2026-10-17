@@ -369,24 +369,25 @@ func runMount(ctx context.Context, args []string) error {
 	if runner != nil {
 		go func() { rcloneDone <- runner.Wait() }()
 	}
+	// teardown stops rclone (when running), drains the endpoint and deletes
+	// the temporary config. Every exit path below ends in it exactly once.
+	teardown := func() {
+		if runner != nil {
+			_ = runner.Process.Kill()
+			<-rcloneDone
+		}
+		sess.Stop()
+	}
 	select {
 	case err := <-rcloneDone:
-		sess.Stop()
+		teardown()
 		return err
 	case err := <-sess.Done():
 		// The endpoint died under us; the mount session is over.
-		if runner != nil {
-			_ = runner.Process.Kill()
-			<-rcloneDone
-		}
-		sess.Stop()
+		teardown()
 		return fmt.Errorf("endpoint stopped serving: %w", err)
 	case <-ctx.Done():
-		if runner != nil {
-			_ = runner.Process.Kill()
-			<-rcloneDone
-		}
-		sess.Stop()
+		teardown()
 		fmt.Fprintln(os.Stderr, "mount session ended; temporary config deleted")
 		return nil
 	}

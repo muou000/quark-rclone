@@ -474,6 +474,10 @@ type writeFile struct {
 	spool     *os.File
 	holder    *uploadErrHolder
 	ctx       context.Context
+	// writeErr records the first body-receive failure. A spool that is not
+	// the complete request body must never be uploaded: a partial file that
+	// reached the provider would still be allocated a FID and become visible.
+	writeErr error
 }
 
 // newWriteFile creates the spool. The upload-error holder comes from the
@@ -500,7 +504,8 @@ func newWriteFile(ctx context.Context, fs *FS, p, parentFID, base string) (*writ
 func (w *writeFile) Write(p []byte) (int, error) {
 	n, err := w.spool.Write(p)
 	if err != nil {
-		return n, &os.PathError{Op: "write", Path: w.fi.name, Err: err}
+		w.writeErr = &os.PathError{Op: "write", Path: w.fi.name, Err: err}
+		return n, w.writeErr
 	}
 	return n, nil
 }
@@ -530,8 +535,23 @@ func (w *writeFile) Readdir(int) ([]os.FileInfo, error) {
 // provider's category so the PUT status fixer can answer 409 for a name
 // conflict and 502-class statuses for transient upstream failures, instead of
 // the generic 405 the webdav handler maps close errors to.
+//
+// A body that did not arrive completely is never uploaded: the webdav
+// handler still calls Close after a failed body copy, and a partial file that
+// reached the provider would hold a live FID and look like a real object.
+// The guards are the spool write record and the request context, which the
+// server cancels the moment the client or the read deadline ends the body.
 func (w *writeFile) Close() error {
 	defer os.Remove(w.spool.Name())
+	if w.writeErr != nil {
+		return w.writeErr
+	}
+	if err := w.ctx.Err(); err != nil {
+		// The body never arrived completely: a stalled client cut by the read
+		// deadline, or a client that hung up. Either way the partial spool
+		// must not become a drive object.
+		return err
+	}
 	size, err := w.spool.Seek(0, io.SeekEnd)
 	if err != nil {
 		w.record(err)

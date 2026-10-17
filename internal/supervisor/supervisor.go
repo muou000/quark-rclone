@@ -2,6 +2,12 @@
 // endpoint, generates the temporary rclone configuration rclone mounts
 // through, and cleans both up when the session ends (issue #18, ADR 0009).
 //
+// Terminology note: ADR 0001's Mount supervisor is the tray process that
+// owns adapter and rclone as child processes. This package is the in-process
+// assembly of one mount session — the part of that supervisor role this
+// repository implements today; the process-tree supervisor arrives with the
+// tray issue.
+//
 // The security boundary is the loopback bind plus the pinned Cookie header —
 // there is no second Basic Auth credential to invent, which is exactly why
 // the temporary config file is part of the mount safety contract: it carries
@@ -22,11 +28,6 @@ import (
 	"github.com/muou000/quark-rclone/internal/quarkapi"
 	"github.com/muou000/quark-rclone/internal/session"
 )
-
-// defaultDirTTL is how long a DAV directory listing stays cached. Short
-// enough that an out-of-band provider change surfaces, long enough that a
-// rclone stat burst costs one listing.
-const defaultDirTTL = 30 * time.Second
 
 // Config describes one mount session.
 type Config struct {
@@ -53,7 +54,6 @@ type Config struct {
 
 // Session is one running mount session. Stop tears everything down.
 type Session struct {
-	store      *session.Store
 	refresher  *session.Refresher
 	server     *dav.Server
 	configPath string
@@ -87,7 +87,6 @@ func Start(ctx context.Context, cfg Config) (*Session, error) {
 		Cookie:   cfg.Cookie,
 		RootFID:  cfg.RootFID,
 		Service:  svc,
-		DirTTL:   defaultDirTTL,
 	})
 	if err := server.Listen(); err != nil {
 		return nil, err
@@ -101,6 +100,10 @@ func Start(ctx context.Context, cfg Config) (*Session, error) {
 		return nil, fmt.Errorf("supervisor: temp dir: %w", err)
 	}
 	configPath := filepath.Join(configDir, "rclone.conf")
+	// ADR 0009 calls the location ACL-restricted. The 0600 mode carries that
+	// on POSIX; on Windows the Unix mode is best-effort and the boundary is
+	// the per-user ACL the profile %TEMP% directory inherits. Explicit ACL
+	// hardening and DPAPI encryption land with the DPAPI credential issue.
 	if err := os.WriteFile(configPath, renderRcloneConfig(cfg.Port, cfg.Cookie), 0o600); err != nil {
 		_ = server.Close()
 		_ = os.RemoveAll(configDir)
@@ -111,7 +114,6 @@ func Start(ctx context.Context, cfg Config) (*Session, error) {
 	refresher.Start(ctx)
 
 	s := &Session{
-		store:      store,
 		refresher:  refresher,
 		server:     server,
 		configPath: configPath,
@@ -146,11 +148,12 @@ func (s *Session) ConfigPath() string { return s.configPath }
 // diagnostics print.
 func (s *Session) URL() string { return "http://" + s.server.Addr() + "/dav" }
 
-// CookieSnapshot exposes the live credential for diagnostics.
-func (s *Session) CookieSnapshot() string { return s.store.CookieSnapshot() }
-
 // Stop drains the endpoint, stops the keep-alive loop and deletes the
 // temporary config. It is safe to call more than once.
+//
+// Reauthentication is not part of Stop: ADR 0009's "reauthentication
+// regenerates the file and restarts the mount session" is a fresh Start with
+// a newly validated cookie, driven by the reauth flow of a later ticket.
 func (s *Session) Stop() {
 	s.refresher.Stop()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
