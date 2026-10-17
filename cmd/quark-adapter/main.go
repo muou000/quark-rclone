@@ -40,6 +40,7 @@ import (
 	"github.com/muou000/quark-rclone/internal/quarkapi"
 	"github.com/muou000/quark-rclone/internal/quarkerr"
 	"github.com/muou000/quark-rclone/internal/redact"
+	"github.com/muou000/quark-rclone/internal/releasegate"
 	"github.com/muou000/quark-rclone/internal/session"
 	"github.com/muou000/quark-rclone/internal/supervisor"
 	"github.com/muou000/quark-rclone/internal/upgrade"
@@ -73,6 +74,7 @@ commands:
   capabilities  print the backend capability statement
   probe-write   run the manual write diagnostic and print the capability snapshot (issue #22)
   upgrade-stage stage a release payload into the app root for the tray to apply (issue #25)
+  accept        run the release acceptance matrix and report (issue #26)
 
 common flags:
   -cookie-file path   file holding the active cookie (import writes it)
@@ -217,6 +219,8 @@ func run(ctx context.Context, cmd string, args []string) error {
 		return runProbeWrite(ctx, args)
 	case "upgrade-stage":
 		return runUpgradeStage(ctx, args)
+	case "accept":
+		return runAccept(ctx, args)
 	default:
 		return fmt.Errorf("unknown command %q", cmd)
 	}
@@ -537,6 +541,85 @@ func runUpgradeStage(ctx context.Context, args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "已暂存升级 %s 到 %s\n在托盘的设置页点击「停止挂载并应用升级」，或重启托盘后操作。\n", *version, m.StagingDir())
 	return nil
+}
+
+// runAccept runs the release acceptance matrix (issue #26, ADR 0007/0014):
+// the blocking test suites, the runtime gates, and — with a dedicated
+// account's credential — the live provider lifecycle. Any blocking failure
+// exits non-zero; a run without the live layer exits 2 (incomplete, not
+// failed), because ADR 0007 forbids calling a release verified without it.
+func runAccept(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("accept", flag.ContinueOnError)
+	live := fs.Bool("live", false, "运行专用账号生命周期门槛（AC1，发布必跑）")
+	cookieFile := fs.String("cookie-file", "", "专用账号 Cookie 文件（-live 时二选一）")
+	useProfile := fs.Bool("profile", false, "从 profile 读取专用账号 Cookie（-live 时二选一）")
+	profileDir := fs.String("profile-dir", "", "覆盖 profile 目录（诊断用）")
+	skipTests := fs.Bool("skip-tests", false, "跳过测试套件门槛（发布流程禁止）")
+	bundleDir := fs.String("bundle-dir", "", "覆盖 rclone 运行包目录（默认：<exe>\\bundle）")
+	jsonOut := fs.String("json", "", "将报告写入该 JSON 文件")
+	workDir := fs.String("workdir", "", "go test 工作目录（默认当前目录）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	env := releasegate.Detect()
+	o := releasegate.Options{
+		RunTests:  !*skipTests,
+		Live:      *live,
+		BundleDir: *bundleDir,
+		WorkDir:   *workDir,
+	}
+	if *live {
+		cookie := ""
+		switch {
+		case *cookieFile != "":
+			var readErr error
+			if cookie, readErr = readCookieFile(*cookieFile); readErr != nil {
+				return readErr
+			}
+		case *useProfile:
+			store, loadErr := openProfileStore(*profileDir)
+			if loadErr != nil {
+				return loadErr
+			}
+			var loadErr2 error
+			if cookie, loadErr2 = store.LoadCookie(); loadErr2 != nil {
+				return fmt.Errorf("读取专用账号凭据：%w", loadErr2)
+			}
+		default:
+			return errors.New("-live 需要 -cookie-file 或 -profile 提供专用账号 Cookie")
+		}
+		if cookie == "" {
+			return errors.New("-live 的专用账号 Cookie 为空")
+		}
+		// The live gates run against a throwaway session: a validation
+		// failure there must not touch the operator's own profile.
+		store := session.NewStore(cookie, nil)
+		o.Provider = releasegate.NewAdapterProvider(adapter.New(quarkapi.New(store, quarkapi.Config{}, nil), store))
+		o.LiveCookie = cookie
+	}
+
+	report := releasegate.Run(ctx, o, env)
+	fmt.Print(report.RenderText())
+	if *jsonOut != "" {
+		data, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(*jsonOut, append(data, '\n'), 0o644); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "报告已写入 %s\n", *jsonOut)
+	}
+
+	switch code := report.ExitCode(); code {
+	case 0:
+		return nil
+	default:
+		fmt.Fprintf(os.Stderr, "quark-adapter: 验收退出码 %d\n", code)
+		os.Exit(code)
+		return nil // unreachable
+	}
 }
 
 // diagProbeContent is the diagnostic file's whole content: self-describing and

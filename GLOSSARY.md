@@ -141,3 +141,7 @@ _Avoid_: password, session id, API key
 **Single-instance guard**:
 The per-session named mutex that stops a second tray instance of any version from starting, so one drive letter and one cache directory never have two owners.
 _Avoid_: lock file, watchdog, duplicate check
+
+**Quarantine directory**:
+The timestamped drive folder the dedicated account's acceptance lifecycle creates, exercises and deletes; everything the release verification writes stays inside it.
+_Avoid_: test folder, temp dir, scratch space
