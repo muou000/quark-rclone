@@ -14,8 +14,9 @@ import (
 )
 
 // winfspRegistryKey is where the WinFsp installer records itself (ADR 0006:
-// the registry install path is one of the pre-check gates). The 64-bit view
-// is forced because this build is x64-only.
+// the registry install path is one of the pre-check gates). The official
+// installer is a 32-bit MSI, so the record lands in the 32-bit view
+// (WOW6432Node) even on x64; winfspInstallDir consults both views.
 const winfspRegistryKey = `SOFTWARE\WinFsp`
 
 // winfspDLLName names the architecture-matching driver support library. The
@@ -84,22 +85,35 @@ func CheckWinFsp() WinFspCheck {
 	}
 }
 
-// winfspInstallDir reads the installer's record from the 64-bit registry view.
+// winfspInstallDir reads the installer's record from the registry. The
+// official WinFsp MSI is 32-bit, so it writes InstallDir under the 32-bit
+// view (WOW6432Node) even on an x64 machine; the 64-bit view is kept as a
+// fallback for other installer layouts. An x64-only 64-bit-view read was
+// observed to miss real installs, hence the two-view probe.
 func winfspInstallDir() (string, error) {
-	key, err := registry.OpenKey(registry.LOCAL_MACHINE, winfspRegistryKey,
-		registry.QUERY_VALUE|registry.WOW64_64KEY)
-	if err != nil {
-		return "", err
+	views := []uint32{registry.WOW64_32KEY, registry.WOW64_64KEY}
+	var firstErr error
+	for _, view := range views {
+		key, err := registry.OpenKey(registry.LOCAL_MACHINE, winfspRegistryKey, registry.QUERY_VALUE|view)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		dir, _, err := key.GetStringValue("InstallDir")
+		key.Close()
+		if err == nil && strings.TrimSpace(dir) != "" {
+			return dir, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
 	}
-	defer key.Close()
-	dir, _, err := key.GetStringValue("InstallDir")
-	if err != nil {
-		return "", err
+	if firstErr == nil {
+		firstErr = fmt.Errorf("InstallDir is empty")
 	}
-	if strings.TrimSpace(dir) == "" {
-		return "", fmt.Errorf("InstallDir is empty")
-	}
-	return dir, nil
+	return "", firstErr
 }
 
 // winfspDLL locates the architecture-matching DLL, preferring the system
