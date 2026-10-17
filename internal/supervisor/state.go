@@ -100,12 +100,15 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 			return nil
 		}
 		// ERROR_SHARING_VIOLATION: a reader holds the target open. A short
-		// retry is enough; anything else surfaces immediately.
+		// retry usually outlives the reader; if it does not, the ordered
+		// direct write below keeps the file correct at the cost of the
+		// rename's atomicity — the status file is diagnostic data, and a
+		// lost rename must not wedge the lifecycle.
 		if attempt < 20 && errors.Is(err, errSharingViolation) {
 			time.Sleep(5 * time.Millisecond)
 			continue
 		}
-		return err
+		return os.WriteFile(path, data, mode)
 	}
 }
 

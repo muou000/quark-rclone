@@ -498,6 +498,7 @@ func runMount(ctx context.Context, args []string) error {
 	rcloneSHA256 := fs.String("rclone-sha256", "", "explicit SHA-256 vouching for a non-bundled -rclone binary (required with -rclone)")
 	mountPoint := fs.String("mount-point", "", "drive letter or directory rclone mounts at")
 	bundleDir := fs.String("bundle-dir", "", "override the runtime bundle directory for the pre-check (default: <exe>\\bundle)")
+	statePathFlag := fs.String("state-path", "", "override the lifecycle state file (default: profile dir\\state.json in -profile mode)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -552,11 +553,15 @@ func runMount(ctx context.Context, args []string) error {
 	// The supervised lifecycle (issue #21) owns everything from here: the
 	// adapter endpoint, the rclone child, the drive letter, restarts and the
 	// shutdown order. The CLI subscribes to the state stream and waits.
-	statePath := ""
-	if profileStore != nil {
+	statePath := *statePathFlag
+	if statePath == "" && profileStore != nil {
 		// Persist the lifecycle state beside the profile (ADR 0005).
 		statePath = filepath.Join(profileStore.Dir(), "state.json")
 	}
+	// Real readiness (ADR 0004): the provider's /config through the live
+	// credential, probed before rclone is ever asked to mount.
+	probeStore := session.NewStore(cookie, nil)
+	probeAPI := quarkapi.New(probeStore, quarkapi.Config{}, nil)
 	sup := supervisor.Supervise(ctx, supervisor.SupervisorConfig{
 		Port:           *port,
 		Cookie:         cookie,
@@ -570,6 +575,7 @@ func runMount(ctx context.Context, args []string) error {
 		WriteChunkSize: profileConfig.Writes.WriteChunkSize,
 		CacheDir:       profileConfig.CacheDir,
 		StatePath:      statePath,
+		ReadyProbe:     probeAPI.ProbeConfig,
 	})
 	states := sup.Subscribe()
 	printDone := make(chan struct{})
@@ -609,8 +615,9 @@ func runMount(ctx context.Context, args []string) error {
 	case supervisor.StateFailed:
 		return fmt.Errorf("挂载会话失败：%s %s", final.Phase, final.Err)
 	default:
-		// NeedsReauth / DriveConflict / WinFspRequired: the user must act.
-		return fmt.Errorf("挂载已暂停（%s）：%s", final.State, final.Err)
+		// NeedsReauth / DriveConflict / WinFspRequired: the user must act,
+		// and the pause reason survives the clean shutdown at this boundary.
+		return fmt.Errorf("挂载已暂停（%s）：%s", sup.PauseReason(), final.Err)
 	}
 }
 

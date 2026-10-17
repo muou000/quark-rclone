@@ -278,6 +278,15 @@ func (c *Client) RefreshSessionCookie(ctx context.Context) error {
 	return nil
 }
 
+// ProbeConfig performs the cheapest authenticated call — /config — with the
+// current credential and no side effects beyond the response's refresh
+// merge. It is the real-readiness probe ADR 0004 asks a supervisor to run
+// before rclone starts.
+func (c *Client) ProbeConfig(ctx context.Context) error {
+	_, err := c.doExplicit(ctx, EndpointConfig, http.MethodGet, nil, nil, c.source.CookieSnapshot(), nil)
+	return err
+}
+
 // applyRefresh merges observed refresh fields into a cookie string.
 func applyRefresh(cookie string, fields map[string]string) string {
 	for name, value := range fields {

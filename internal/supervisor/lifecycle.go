@@ -68,16 +68,22 @@ type Supervisor struct {
 	// Lifecycle-owned state, touched only by the run goroutine. They need no
 	// lock: the run goroutine is the single writer, and Stop reads them only
 	// after done closes.
-	sess      *Session
-	rclone    RcloneProcess
-	procDone  chan error
-	lastMount string // the rclone child's captured stderr, for classification
+	sess     *Session
+	rclone   RcloneProcess
+	procDone chan error
+	// rcloneExitText holds the dead child's captured stderr for the failure
+	// classification that follows its exit.
+	rcloneExitText string
 
 	mu          sync.Mutex
 	status      Status
 	subs        map[chan Status]struct{}
 	final       Status
 	mountedSeen bool
+	// pauseReason remembers the paused state the lifecycle parked in, so the
+	// caller can tell "stopped cleanly" from "stopped because the user must
+	// act" even though both end at Disabled.
+	pauseReason State
 }
 
 // Supervise starts the lifecycle and returns immediately. The caller reads
@@ -140,6 +146,18 @@ func (s *Supervisor) ReachedMounted() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mountedSeen
+}
+
+// PauseReason reports the paused state the lifecycle parked in, or Disabled
+// when it stopped cleanly. The tray and the CLI need this distinction at the
+// process boundary, where every terminal state is otherwise Disabled.
+func (s *Supervisor) PauseReason() State {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pauseReason.Paused() {
+		return s.pauseReason
+	}
+	return StateDisabled
 }
 
 // Stop cancels the lifecycle and blocks until the shutdown sequence —
@@ -206,13 +224,10 @@ func (s *Supervisor) run() {
 
 	s.transition(StateStarting, "preflight", "")
 	if err := s.runPreflight(); err != nil {
-		// WinFsp wording means the driver gate; anything else is a runtime
-		// bundle defect. Both pause retrying (ADR 0004).
-		state := StateFailed
-		if strings.Contains(strings.ToLower(err.Error()), "winfsp") {
-			state = StateWinFspRequired
-		}
-		s.stopLifecycle(state, "preflight", err.Error())
+		// The verdict is structured for the production gates; an injected
+		// probe's text is classified by the driver's own name. Both pause
+		// retrying (ADR 0004).
+		s.stopLifecycle(s.preflightVerdict(err), "preflight", err.Error())
 		return
 	}
 
@@ -243,7 +258,8 @@ func (s *Supervisor) run() {
 }
 
 // runPreflight runs the runtime gates. The injected probe wins; production
-// checks the bundled rclone and WinFsp.
+// checks the bundled rclone and WinFsp and classifies from the structured
+// check results, not from message text.
 func (s *Supervisor) runPreflight() error {
 	if s.cfg.Preflight != nil {
 		return s.cfg.Preflight()
@@ -255,6 +271,16 @@ func (s *Supervisor) runPreflight() error {
 		return errors.New(wc.Detail)
 	}
 	return nil
+}
+
+// preflightVerdict maps a preflight failure onto its paused state: the WinFsp
+// gate's verdict is structured, so an injected probe's text is the only
+// heuristic left, and it keys on the driver's own name.
+func (s *Supervisor) preflightVerdict(err error) State {
+	if strings.Contains(strings.ToLower(errText(err)), "winfsp") {
+		return StateWinFspRequired
+	}
+	return StateFailed
 }
 
 // runAttempt builds one mount: adapter session, readiness, rclone, letter.
@@ -297,7 +323,7 @@ func (s *Supervisor) runAttempt() State {
 	procDone := make(chan error, 1)
 	go func() { procDone <- proc.Wait() }()
 	s.procDone = procDone
-	s.lastMount = ""
+	s.rcloneExitText = ""
 
 	// The letter becomes reachable within seconds of a healthy mount; a
 	// driver or letter problem shows up as the process exiting early.
@@ -310,14 +336,14 @@ func (s *Supervisor) runAttempt() State {
 		}
 		select {
 		case err := <-s.procDone:
-			s.lastMount = errText(err)
+			s.rcloneExitText = errText(err)
 			return s.classifyMountDeath()
 		case <-s.ctx.Done():
 			return StateStopping
 		default:
 		}
 		if time.Now().After(deadline) {
-			s.lastMount = "mount did not appear within 30s"
+			s.rcloneExitText = "mount did not appear within 30s"
 			return s.classifyMountDeath()
 		}
 		time.Sleep(500 * time.Millisecond)
@@ -354,8 +380,8 @@ func (s *Supervisor) monitor() bool {
 	case err := <-s.procDone:
 		// rclone died on its own. Clean the letter before restarting so no
 		// stale instance survives (issue #21: no leftovers, no duplicates).
-		s.lastMount = errText(err)
-		s.transition(StateRecovering, "rclone exited", s.lastMount)
+		s.rcloneExitText = errText(err)
+		s.transition(StateRecovering, "rclone exited", s.rcloneExitText)
 		s.teardownRclone()
 		return true
 	case err := <-s.sess.Done():
@@ -488,19 +514,27 @@ func (s *Supervisor) rcloneArgs(configPath string) []string {
 // stopLifecycle parks the supervisor in a paused state: the status is
 // terminal until Stop, and the adapter session — when one exists — stays up
 // for diagnostics (ADR 0003: NeedsReauth keeps the adapter and the profile).
+// The reason is remembered so a later Stop reports why, not just that.
 func (s *Supervisor) stopLifecycle(state State, phase, errMsg string) {
+	s.mu.Lock()
+	if state.Paused() {
+		s.pauseReason = state
+	}
+	s.mu.Unlock()
 	s.transition(state, phase, errMsg)
 	<-s.ctx.Done()
 	s.shutdown()
 }
 
-// classifyFarSide sorts a readiness or launch failure: authentication
-// wording is NeedsReauth and pauses; everything else is the network, which
+// classifyFarSide sorts a readiness or launch failure: the provider's
+// authentication signatures (issue #2's 31001/need login, plus an explicit
+// HTTP 401) are NeedsReauth and pause; everything else is the network, which
 // retries.
 func (s *Supervisor) classifyFarSide(phase string, err error) State {
 	lower := strings.ToLower(errText(err))
 	if strings.Contains(lower, "31001") || strings.Contains(lower, "need login") ||
-		strings.Contains(lower, "401") || strings.Contains(lower, "unauthorized") {
+		strings.Contains(lower, "unauthorized") ||
+		strings.Contains(lower, "http 401") || strings.Contains(lower, "401 unauthorized") {
 		s.transition(StateNeedsReauth, phase, errText(err))
 		return StateNeedsReauth
 	}
@@ -512,7 +546,7 @@ func (s *Supervisor) classifyFarSide(phase string, err error) State {
 // tears the dead process down first so no instance survives.
 func (s *Supervisor) classifyMountDeath() State {
 	s.teardownRclone()
-	return s.classifyFarSide("rclone", errors.New(s.lastMount))
+	return s.classifyFarSide("rclone", errors.New(s.rcloneExitText))
 }
 
 // errText renders an error for classification and reporting; a nil error is
