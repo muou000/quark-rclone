@@ -130,9 +130,12 @@ func newHarness(t *testing.T, mutate func(*SupervisorConfig)) *supHarness {
 		MountPoint:      "Q:",
 		BackoffSchedule: []time.Duration{time.Millisecond, time.Millisecond},
 		ShutdownTimeout: 2 * time.Second,
-		Preflight:       func() error { return nil },
-		ProbeDrive:      h.probe.probe,
-		LaunchRclone:    h.launch.do,
+		// Isolate the instance cache directory per test; nothing ever cleans
+		// it up, so a shared temp location would grow across runs.
+		CacheRoot:    t.TempDir(),
+		Preflight:    func() error { return nil },
+		ProbeDrive:   h.probe.probe,
+		LaunchRclone: h.launch.do,
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -500,3 +503,100 @@ func TestStatusRedactsErrors(t *testing.T) {
 }
 
 func probeFalse(mountPoint string) bool { return false }
+
+// TestCacheInstanceKeyIsStableAndSafe pins the instance-key derivation (issue
+// #23, ADR 0011): a volume spelled differently lands in the same directory,
+// directory mount points get deterministic, mutually distinct keys, and no
+// key can escape the cache root as a dot segment.
+func TestCacheInstanceKeyIsStableAndSafe(t *testing.T) {
+	// Bare drive letters: one volume, one key, whatever the spelling.
+	for _, in := range []string{"Q:", "q:", "Q", "q"} {
+		if got := cacheInstanceKey(in); got != "q" {
+			t.Errorf("cacheInstanceKey(%q) = %q, want q", in, got)
+		}
+	}
+	for _, in := range []string{"", ":", "   "} {
+		if got := cacheInstanceKey(in); got != "default" {
+			t.Errorf("cacheInstanceKey(%q) = %q, want default", in, got)
+		}
+	}
+
+	// Directory mount points: readable prefix, deterministic hash, mutually
+	// distinct, and always one safe path segment.
+	dirCases := []string{`D:\data\`, `D:\data`, `\\server\share`, `D:\mnt\quark`, `D:\mnt-quark`, `X:..\..\evil`, "..", "."}
+	seen := map[string]string{}
+	for _, in := range dirCases {
+		got := cacheInstanceKey(in)
+		if got != cacheInstanceKey(in) {
+			t.Errorf("cacheInstanceKey(%q) is not stable", in)
+		}
+		if strings.ContainsAny(got, `\/:`) || got == "." || got == ".." {
+			t.Errorf("cacheInstanceKey(%q) = %q, want one safe segment", in, got)
+		}
+		if other, dup := seen[got]; dup {
+			t.Errorf("keys of %q and %q collide on %q", in, other, got)
+		}
+		seen[got] = in
+	}
+	if !strings.HasPrefix(cacheInstanceKey(`D:\data`), "d-data-") {
+		t.Errorf("sanitized prefix lost: %q", cacheInstanceKey(`D:\data`))
+	}
+	if !strings.HasPrefix(cacheInstanceKey(`\\server\share`), "server-share-") {
+		t.Errorf("sanitized prefix lost: %q", cacheInstanceKey(`\\server\share`))
+	}
+}
+
+// TestRcloneArgsPinWritesCacheDefaults checks the ADR 0002 write path (issue
+// #23): the mount always runs a VFS cache mode (writes unless configured
+// otherwise) and always gets this instance's own cache directory, with the
+// profile's write-back parameters passed through when present.
+func TestRcloneArgsPinWritesCacheDefaults(t *testing.T) {
+	h := newHarness(t, func(c *SupervisorConfig) {
+		c.WriteBack = "5s"
+		c.WriteChunkSize = "128Mi"
+	})
+	args := h.sup.rcloneArgs("cfg-path")
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"--vfs-cache-mode writes",
+		"--cache-dir " + h.sup.CacheDir(),
+		"--vfs-write-back 5s",
+		"--vfs-write-chunk-size 128Mi",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("rclone args missing %q: %s", want, joined)
+		}
+	}
+
+	// An explicit mode is honoured, not overridden.
+	h2 := newHarness(t, func(c *SupervisorConfig) { c.CacheMode = "full" })
+	if got := h2.sup.cacheMode(); got != "full" {
+		t.Fatalf("cacheMode = %q, want the explicit value", got)
+	}
+	// An empty root falls back to a per-user temp location, never to rclone's
+	// shared default.
+	h3 := newHarness(t, func(c *SupervisorConfig) { c.CacheRoot = "" })
+	if dir := h3.sup.CacheDir(); !strings.Contains(dir, "quark-rclone-cache") {
+		t.Fatalf("fallback cache dir = %q, want the dedicated temp root", dir)
+	}
+}
+
+// TestCacheDirCreatedBeforeLaunchAndSurvivesStop is the dirty-cache recovery
+// contract: the instance directory exists before rclone starts and is never
+// deleted by the supervisor — dirty cache left behind must be there for the
+// next mount of the same letter (issue #23, ADR 0002).
+func TestCacheDirCreatedBeforeLaunchAndSurvivesStop(t *testing.T) {
+	probe := &probeSeq{seq: []bool{false, true}, fallback: false}
+	h := newHarness(t, func(c *SupervisorConfig) {
+		c.ProbeDrive = probe.probe
+	})
+	await(t, h, StateMounted, 5*time.Second)
+	dir := h.sup.CacheDir()
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		t.Fatalf("instance cache dir was not created before launch: %v", err)
+	}
+	h.sup.Stop()
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("cache dir must survive Stop: %v", err)
+	}
+}

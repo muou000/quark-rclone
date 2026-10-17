@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/muou000/quark-rclone/internal/adapter"
+	"github.com/muou000/quark-rclone/internal/quarkerr"
 	"github.com/muou000/quark-rclone/internal/redact"
 )
 
@@ -86,7 +87,12 @@ const EventWritebackFailed = "writeback_failed"
 type WritebackFailure struct {
 	// Event is always EventWritebackFailed; it exists so a consumer reads one
 	// stable token rather than inferring the event from the JSON key.
-	Event     string    `json:"event"`
+	Event string `json:"event"`
+	// Category is the stable error class behind the failure (issue #23): what
+	// the tray shows instead of a raw errno, and the same vocabulary every
+	// other layer speaks. Never empty for a recorded entry — unclassified
+	// errors are recorded as "unknown".
+	Category  string    `json:"category"`
 	Path      string    `json:"path"`
 	Retries   int       `json:"retries"`
 	NextRetry time.Time `json:"next_retry,omitempty"`
@@ -210,21 +216,25 @@ func (r *Recorder) recordProbe(p Probe) {
 	r.persist()
 }
 
-// RecordWritebackFailure adds one refused writeback for path. Repeated
+// RecordWritebackFailure adds one refused writeback for path. The error is
+// classified here — the category travels with the entry so a tray never has
+// to re-derive it — and its text is redacted before storage. Repeated
 // failures for the same path accumulate: the retry count grows by one and the
 // next-retry time follows the diagnostic cadence. The ledger is bounded; when
-// full, the oldest entry falls off. The error text is redacted before storage.
-func (r *Recorder) RecordWritebackFailure(path, errText string) {
-	if path == "" {
+// full, the oldest entry falls off.
+func (r *Recorder) RecordWritebackFailure(path string, err error) {
+	if path == "" || err == nil {
 		return
 	}
 	now := time.Now()
+	errText := err.Error()
 	entry := WritebackFailure{
-		Event:   EventWritebackFailed,
-		Path:    path,
-		At:      now,
-		Err:     redact.Text(errText),
-		Retries: 1,
+		Event:    EventWritebackFailed,
+		Category: string(quarkerr.CategoryOf(err)),
+		Path:     path,
+		At:       now,
+		Err:      redact.Text(errText),
+		Retries:  1,
 	}
 	r.mu.Lock()
 	idx := -1

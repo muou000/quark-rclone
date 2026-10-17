@@ -494,13 +494,27 @@ func runProbeWrite(ctx context.Context, args []string) error {
 		fmt.Fprintln(os.Stderr, line)
 	}
 	for _, wb := range snap.Writeback {
-		fmt.Fprintf(os.Stderr, "[回写失败] %s：已重试 %d 次，下次重试 %s\n",
-			wb.Path, wb.Retries, wb.NextRetry.Format("15:04:05"))
+		fmt.Fprintf(os.Stderr, "[回写失败] %s（%s）：已重试 %d 次，下次重试 %s\n",
+			wb.Path, wb.Category, wb.Retries, wb.NextRetry.Format("15:04:05"))
 	}
 	if failed {
 		return errors.New("写入诊断未通过，详见上方快照")
 	}
 	return nil
+}
+
+// resolveCacheRoot resolves the VFS cache root: the profile's explicit
+// setting, else a directory beside the profile, else empty — the supervisor
+// then falls back to a per-user temp location. The per-instance directory
+// beneath the root is derived by the supervisor (issue #23).
+func resolveCacheRoot(profileStore *profile.Store, explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if profileStore != nil {
+		return filepath.Join(profileStore.Dir(), "cache")
+	}
+	return ""
 }
 
 // resolveDiagPath resolves the capability snapshot file: the explicit
@@ -715,13 +729,17 @@ func runMount(ctx context.Context, args []string) error {
 		CacheMode:      profileConfig.Writes.CacheMode,
 		WriteBack:      profileConfig.Writes.WriteBack,
 		WriteChunkSize: profileConfig.Writes.WriteChunkSize,
-		CacheDir:       profileConfig.CacheDir,
+		CacheRoot:      resolveCacheRoot(profileStore, profileConfig.CacheDir),
 		StatePath:      statePath,
 		ReadyProbe:     probeAPI.ProbeConfig,
 		Recorder:       rec,
 		ProbeCaps:      probeCaps,
 	})
 	states := sup.Subscribe()
+	// The cache location is part of the write contract (issue #23): the user
+	// should know where the dirty cache lives before the first write, because
+	// nothing ever deletes it automatically.
+	fmt.Fprintf(os.Stderr, "缓存目录: %s（实例独占；dirty cache 保留于此，不会自动删除）\n", sup.CacheDir())
 	printDone := make(chan struct{})
 	go func() {
 		defer close(printDone)
@@ -743,6 +761,21 @@ func runMount(ctx context.Context, args []string) error {
 	}()
 	final := sup.Wait()
 	<-printDone
+
+	// The real write-back state at the boundary (issue #23, ADR 0002): a
+	// ledger that still holds entries means dirty cache survived on purpose —
+	// named, counted, and retried by the next mount of the same letter, never
+	// deleted.
+	if wb := rec.Snapshot().Writeback; len(wb) > 0 {
+		fmt.Fprintf(os.Stderr, "注意：%d 个文件的回写未完成，dirty cache 保留在缓存目录中，下次挂载同一盘符时自动重试：\n", len(wb))
+		for i, e := range wb {
+			if i == 5 {
+				fmt.Fprintf(os.Stderr, "  …（共 %d 个，完整列表见 diag.json 或 /diagnostics）\n", len(wb))
+				break
+			}
+			fmt.Fprintf(os.Stderr, "  %s（%s，已重试 %d 次）\n", e.Path, e.Category, e.Retries)
+		}
+	}
 
 	// The letter this session actually held is what the next auto recovery
 	// tries first (ADR 0005); only a session that reached Mounted records it.

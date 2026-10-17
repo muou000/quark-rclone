@@ -242,7 +242,7 @@ func (f *FS) recordWritebackFailure(davPath string, err error) {
 	if f.recorder == nil {
 		return
 	}
-	f.recorder.RecordWritebackFailure(davPath, err.Error())
+	f.recorder.RecordWritebackFailure(davPath, err)
 }
 
 // resolveWriteback clears a path's ledger entry once its writeback went

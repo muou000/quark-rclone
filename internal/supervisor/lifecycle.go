@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,7 +33,14 @@ type SupervisorConfig struct {
 	CacheMode      string
 	WriteBack      string
 	WriteChunkSize string
-	CacheDir       string
+	// CacheRoot is the base directory under which this mount instance keeps
+	// its own cache directory (issue #23, ADR 0002/0005). The instance
+	// directory <CacheRoot>/<mount-point key> is exclusive to this mount —
+	// two rclone processes sharing one cache corrupt each other's state —
+	// and stable across restarts, so dirty cache survives a supervisor
+	// restart and the upload resumes. Empty falls back to a per-user temp
+	// location; it is never deleted by the supervisor.
+	CacheRoot string
 
 	// Behaviour. An empty BackoffSchedule takes the ADR 0004 cadence; a zero
 	// ShutdownTimeout takes 15s; an empty StatePath disables persistence.
@@ -328,6 +336,10 @@ func (s *Supervisor) runAttempt() State {
 			fmt.Sprintf("盘符 %s 已被其它卷占用：请更换盘符后重试。", s.cfg.MountPoint))
 		return StateDriveConflict
 	}
+	if err := s.ensureCacheDir(); err != nil {
+		s.transition(StateFailed, "rclone", fmt.Sprintf("缓存目录创建失败：%v", err))
+		return StateFailed
+	}
 	proc, err := s.launchRclone(s.ctx, s.sess.ConfigPath())
 	if err != nil {
 		return s.classifyFarSide("rclone", err)
@@ -515,13 +527,18 @@ func (s *Supervisor) launchRclone(ctx context.Context, configPath string) (Rclon
 	return &execProcess{cmd: cmd, stderr: &stderr}, nil
 }
 
-// rcloneArgs assembles the mount command: the temporary session config
-// supplies the credential, the profile's write-back settings drive the
-// mount (issue #19).
+// rcloneArgs assembles the mount command. The temporary session config
+// supplies the credential. The write path is the ADR 0002 contract (issue
+// #23): the VFS cache mode is pinned to writes unless the profile says
+// otherwise, and the cache directory is this instance's own — derived from
+// the mount point, stable across restarts so dirty cache resumes, and never
+// deleted by the supervisor.
 func (s *Supervisor) rcloneArgs(configPath string) []string {
-	args := []string{"mount", "quark:", s.cfg.MountPoint, "--config", configPath}
-	if s.cfg.CacheMode != "" {
-		args = append(args, "--vfs-cache-mode", s.cfg.CacheMode)
+	args := []string{
+		"mount", "quark:", s.cfg.MountPoint,
+		"--config", configPath,
+		"--vfs-cache-mode", s.cacheMode(),
+		"--cache-dir", s.CacheDir(),
 	}
 	if s.cfg.WriteBack != "" {
 		args = append(args, "--vfs-write-back", s.cfg.WriteBack)
@@ -529,10 +546,89 @@ func (s *Supervisor) rcloneArgs(configPath string) []string {
 	if s.cfg.WriteChunkSize != "" {
 		args = append(args, "--vfs-write-chunk-size", s.cfg.WriteChunkSize)
 	}
-	if s.cfg.CacheDir != "" {
-		args = append(args, "--cache-dir", s.cfg.CacheDir)
-	}
 	return args
+}
+
+// cacheMode is the VFS cache mode this mount runs with. ADR 0002/0005 pin
+// "writes" for the Windows common write path; an explicit profile value is
+// honoured so a diagnostic can run another mode deliberately.
+func (s *Supervisor) cacheMode() string {
+	if s.cfg.CacheMode == "" {
+		return "writes"
+	}
+	return s.cfg.CacheMode
+}
+
+// CacheDir reports the exclusive VFS cache directory this mount instance
+// uses. It exists so the CLI can tell the user where the dirty cache lives —
+// the directory is never cleaned up automatically (ADR 0002).
+func (s *Supervisor) CacheDir() string {
+	root := s.cfg.CacheRoot
+	if root == "" {
+		root = filepath.Join(os.TempDir(), "quark-rclone-cache")
+	}
+	return filepath.Join(root, cacheInstanceKey(s.cfg.MountPoint))
+}
+
+// ensureCacheDir creates the instance's cache directory before rclone starts.
+// Creating it here (rather than letting rclone) means a user-visible cache
+// location exists even when the mount fails early, and the mode is ours to
+// choose.
+func (s *Supervisor) ensureCacheDir() error {
+	dir := s.CacheDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	return nil
+}
+
+// cacheInstanceKey maps a mount point onto one filesystem-safe, stable
+// directory name (issue #23, ADR 0011). A bare drive letter folds to itself —
+// "Q:", "q:" and "Q" are the same volume and must share one directory so
+// dirty cache resumes on the next mount. Anything else is sanitized for
+// display and salted with a short hash of the full mount point, so two
+// distinct directories can never share one cache. The result is always a
+// single path segment and can never escape the cache root; an empty mount
+// point is "default".
+func cacheInstanceKey(mountPoint string) string {
+	letter := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(mountPoint), ":")))
+	switch {
+	case letter == "":
+		return "default"
+	case len(letter) == 1 && letter[0] >= 'a' && letter[0] <= 'z':
+		return letter
+	}
+	return sanitizeCacheKey(letter) + "-" + cacheKeyHash(letter)
+}
+
+// sanitizeCacheKey keeps letters, digits and -_., folding everything else to
+// single dashes, so the display part of a directory key stays readable.
+func sanitizeCacheKey(key string) string {
+	var b strings.Builder
+	for _, r := range key {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	for strings.Contains(out, "--") {
+		out = strings.ReplaceAll(out, "--", "-")
+	}
+	if out == "" {
+		return "dir"
+	}
+	return out
+}
+
+// cacheKeyHash is the short FNV-1a fingerprint that keeps distinct directory
+// mount points in distinct cache directories.
+func cacheKeyHash(s string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(s))
+	return fmt.Sprintf("%08x", h.Sum64()&0xffffffff)
 }
 
 // stopLifecycle parks the supervisor in a paused state: the status is

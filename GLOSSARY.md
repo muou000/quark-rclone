@@ -117,3 +117,11 @@ _Avoid_: supported list, environment note
 **Dirty cache**:
 A local file version that has been written by the user but has not yet been confirmed as uploaded to Quark.
 _Avoid_: offline copy, synchronized file, backup
+
+**Writeback ledger**:
+The per-mount record of dirty-cache writebacks the provider refused, carrying the file path, stable error category, retry count and next retry time.
+_Avoid_: error log, upload queue, retry queue
+
+**Instance cache directory**:
+The VFS cache directory one mount instance owns exclusively, derived from the mount point and kept until the user cleans it.
+_Avoid_: shared cache, temp folder, cache directory (unqualified)

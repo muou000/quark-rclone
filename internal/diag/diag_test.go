@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/muou000/quark-rclone/internal/quarkerr"
 )
 
 func TestStaticCapsDeclareMatrix(t *testing.T) {
@@ -102,8 +104,8 @@ func TestRunProbeRedactsErrorText(t *testing.T) {
 
 func TestWritebackLedgerAccumulatesAndResolves(t *testing.T) {
 	r := NewRecorder()
-	r.RecordWritebackFailure("/doc.txt", "upstream 500")
-	r.RecordWritebackFailure("/doc.txt", "upstream 500")
+	r.RecordWritebackFailure("/doc.txt", quarkerr.New(quarkerr.CatUpstreamTransient, "upload", "upstream 500"))
+	r.RecordWritebackFailure("/doc.txt", quarkerr.New(quarkerr.CatUpstreamTransient, "upload", "upstream 500"))
 
 	snap := r.Snapshot()
 	if len(snap.Writeback) != 1 {
@@ -115,6 +117,9 @@ func TestWritebackLedgerAccumulatesAndResolves(t *testing.T) {
 	}
 	if w.Event != EventWritebackFailed {
 		t.Errorf("event = %q, want %q", w.Event, EventWritebackFailed)
+	}
+	if w.Category != string(quarkerr.CatUpstreamTransient) {
+		t.Errorf("category = %q, want %q", w.Category, quarkerr.CatUpstreamTransient)
 	}
 	if w.NextRetry.Before(time.Now()) {
 		t.Errorf("next retry %s should be in the future", w.NextRetry)
@@ -131,10 +136,35 @@ func TestWritebackLedgerAccumulatesAndResolves(t *testing.T) {
 	r.ResolveWriteback("/doc.txt")
 }
 
+// TestWritebackLedgerClassifiesUnknown covers the honest default: an error
+// with no category is recorded as unknown, never folded into a category that
+// implies a remedy.
+func TestWritebackLedgerClassifiesUnknown(t *testing.T) {
+	r := NewRecorder()
+	r.RecordWritebackFailure("/plain.txt", errors.New("boom"))
+
+	w := r.Snapshot().Writeback
+	if len(w) != 1 || w[0].Category != string(quarkerr.CatUnknown) {
+		t.Fatalf("entry = %+v, want category unknown", w)
+	}
+}
+
+// TestWritebackLedgerIgnoresNilAndEmpty pins the degenerate calls: no path or
+// no error records nothing.
+func TestWritebackLedgerIgnoresNilAndEmpty(t *testing.T) {
+	r := NewRecorder()
+	r.RecordWritebackFailure("", errors.New("no path"))
+	r.RecordWritebackFailure("/p", nil)
+	r.ResolveWriteback("")
+	if got := len(r.Snapshot().Writeback); got != 0 {
+		t.Fatalf("writeback = %d, want 0", got)
+	}
+}
+
 func TestWritebackLedgerCapsNextRetryAndSize(t *testing.T) {
 	r := NewRecorder()
 	for i := 0; i < 50; i++ {
-		r.RecordWritebackFailure("/doc.txt", "flaky")
+		r.RecordWritebackFailure("/doc.txt", errors.New("flaky"))
 	}
 	snap := r.Snapshot()
 	if len(snap.Writeback) != 1 {
@@ -145,7 +175,7 @@ func TestWritebackLedgerCapsNextRetryAndSize(t *testing.T) {
 	}
 
 	for i := 0; i < maxWriteback+10; i++ {
-		r.RecordWritebackFailure("/f"+string(rune('a'+i%26))+string(rune('0'+i/26))+".txt", "flaky")
+		r.RecordWritebackFailure("/f"+string(rune('a'+i%26))+string(rune('0'+i/26))+".txt", errors.New("flaky"))
 	}
 	if got := len(r.Snapshot().Writeback); got > maxWriteback {
 		t.Fatalf("ledger = %d entries, want bounded at %d", got, maxWriteback)
@@ -158,7 +188,7 @@ func TestRecorderPersistsAndAdopts(t *testing.T) {
 	r := NewRecorder()
 	r.SetPersistPath(path)
 	r.RunProbe(context.Background(), ProbeWrite, func(context.Context) error { return nil })
-	r.RecordWritebackFailure("/stuck.bin", "boom")
+	r.RecordWritebackFailure("/stuck.bin", errors.New("boom"))
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -201,18 +231,9 @@ func TestRecorderPersistsAndAdopts(t *testing.T) {
 func TestRecorderWithoutPathStaysInMemory(t *testing.T) {
 	r := NewRecorder()
 	r.RunProbe(context.Background(), ProbeAuth, func(context.Context) error { return nil })
-	r.RecordWritebackFailure("/x", "e")
+	r.RecordWritebackFailure("/x", errors.New("e"))
 	if got := len(r.Snapshot().Probes); got != 1 {
 		t.Fatalf("probes = %d, want 1", got)
-	}
-}
-
-func TestEmptyPathFailuresAreIgnored(t *testing.T) {
-	r := NewRecorder()
-	r.RecordWritebackFailure("", "no path")
-	r.ResolveWriteback("")
-	if got := len(r.Snapshot().Writeback); got != 0 {
-		t.Fatalf("writeback = %d, want 0", got)
 	}
 }
 

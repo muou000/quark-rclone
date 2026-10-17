@@ -113,7 +113,11 @@ func Default() Config {
 		// user had mounted, that is the point of keeping a profile.
 		Autostart:   false,
 		Autorestore: true,
-		CacheDir:    "",
+		// CacheDir is the root under which each mount instance keeps its own
+		// VFS cache directory (issue #23); empty uses a directory beside the
+		// profile. The instance directory itself is derived per mount point
+		// and never deleted automatically.
+		CacheDir: "",
 		Writes: WritesSettings{
 			CacheMode:      "writes",
 			WriteBack:      "5s",

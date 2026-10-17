@@ -3,6 +3,7 @@ package dav
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1059,6 +1060,11 @@ func TestWritebackLedgerRecordsAndResolves(t *testing.T) {
 	if entry.Path != "/stuck.bin" || entry.Retries != 1 {
 		t.Fatalf("entry = %+v, want path /stuck.bin retries 1", entry)
 	}
+	// The scripted 500 is an upstream outage: the ledger must name the stable
+	// category, not just a free-text error (issue #23).
+	if entry.Category != "upstream_transient" {
+		t.Fatalf("entry category = %q, want upstream_transient", entry.Category)
+	}
 	if entry.Err == "" || strings.Contains(entry.Err, "session-cookie") {
 		t.Fatalf("entry error = %q, want redacted detail", entry.Err)
 	}
@@ -1090,7 +1096,7 @@ func TestDiagnosticsServesSnapshot(t *testing.T) {
 	f := newFakeDrive(t)
 	rec := diag.NewRecorder()
 	rec.RunProbe(context.Background(), diag.ProbeAuth, func(context.Context) error { return nil })
-	rec.RecordWritebackFailure("/stuck.bin", "boom")
+	rec.RecordWritebackFailure("/stuck.bin", errors.New("boom"))
 	s := f.startServer(t, func(c *Config) { c.Recorder = rec })
 
 	// Without the cookie the snapshot is refused.

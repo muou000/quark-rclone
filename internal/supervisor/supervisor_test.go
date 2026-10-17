@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -154,7 +155,7 @@ func TestStartRejectsUnusableConfig(t *testing.T) {
 func TestSessionServesCapabilitySnapshot(t *testing.T) {
 	rec := diag.NewRecorder()
 	rec.RunProbe(t.Context(), diag.ProbeAuth, func(context.Context) error { return nil })
-	rec.RecordWritebackFailure("/stuck.bin", "boom")
+	rec.RecordWritebackFailure("/stuck.bin", errors.New("boom"))
 	s := startSession(t, func(c *Config) { c.Recorder = rec })
 	base := strings.TrimSuffix(s.URL(), "/dav")
 
