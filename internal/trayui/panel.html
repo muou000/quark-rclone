@@ -163,11 +163,11 @@
       </div>
     </div>
     <div class="card">
-      <h2>完全重新挂载</h2>
-      <div class="muted" style="margin-bottom:8px">挂载的只是某个文件夹？用这个按钮恢复为整个网盘：停止挂载 → 清空本实例的 VFS 缓存（<b>含未回写成功的 dirty cache，其内容会丢失</b>）→ 根目录重置为整个网盘 → 重新挂载。盘符选择保持不变。</div>
+      <h2>重置为未挂载状态</h2>
+      <div class="muted" style="margin-bottom:8px">停止挂载 → 清空本实例的 VFS 缓存（<b>含未回写成功的 dirty cache，其内容会丢失</b>）→ 清除已保存的登录凭据并恢复默认配置 → 回到「首次配置」状态。之后请按上方教程重新复制并粘贴 Cookie 完成挂载。开机自启动设置保留。</div>
       <div class="row">
-        <button class="primary" id="btn-remount">清空缓存并完全重新挂载</button>
-        <span id="remount-msg" class="msg"></span>
+        <button class="primary" id="btn-reset">清除缓存并重置登录</button>
+        <span id="reset-msg" class="msg"></span>
       </div>
     </div>
     <div class="card">
@@ -352,15 +352,15 @@ $("btn-recheck").onclick = async () => {
   }
 };
 
-$("btn-remount").onclick = async () => {
-  if (!confirm("将停止挂载、清空缓存（未回写成功的文件会丢失），并把根目录重置为整个网盘后重新挂载。继续吗？")) return;
-  const msg = $("remount-msg");
-  msg.className = "msg"; msg.textContent = "正在停止挂载并清空缓存…";
+$("btn-reset").onclick = async () => {
+  if (!confirm("将停止挂载、清空缓存（未回写成功的文件会丢失）、清除已保存的 Cookie 并恢复默认配置，回到首次配置状态。继续吗？")) return;
+  const msg = $("reset-msg");
+  msg.className = "msg"; msg.textContent = "正在停止挂载并清除凭据…";
   try {
-    const r = await fetch("/api/remount", { method:"POST", headers:H });
+    const r = await fetch("/api/reset", { method:"POST", headers:H });
     const j = await r.json();
-    if (!j.ok) { msg.className = "msg err"; msg.textContent = j.error || "重新挂载失败"; return; }
-    msg.className = "msg ok"; msg.textContent = "已重置为整个网盘并重新挂载";
+    if (!j.ok) { msg.className = "msg err"; msg.textContent = j.error || "重置失败"; return; }
+    msg.className = "msg ok"; msg.textContent = "已重置：请按上方教程重新粘贴 Cookie 并挂载";
     panel();
   } catch (e) {
     msg.className = "msg err"; msg.textContent = "请求失败";

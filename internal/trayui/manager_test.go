@@ -140,6 +140,7 @@ type managerHarness struct {
 	optsSeen  []MountOptions    // options handed to start
 	persisted []string          // cookies persisted
 	savedCfg  []MountOptions    // configs saved
+	resets    int               // full-reset hook calls
 	failStart error             // when set, start fails
 	runners   []*fakeRunner     // one fresh runner per start, like real lifecycles
 	rec       *diag.Recorder
@@ -177,6 +178,10 @@ func newManagerHarness(t *testing.T, opts MountOptions) *managerHarness {
 			h.savedCfg = append(h.savedCfg, opts)
 			return nil
 		},
+		func() error {
+			h.resets++
+			return nil
+		},
 		opts,
 		true,
 		NewEventLog(),
@@ -190,12 +195,12 @@ func (h *managerHarness) lastRunner() *fakeRunner {
 	return h.runners[len(h.runners)-1]
 }
 
-// TestFullRemountResetsRootClearsCacheAndRestarts pins the one-click reset:
-// the root returns to the whole drive with the letter preserved, the
-// instance's VFS cache directory is really deleted (only after the runner
-// stopped), and the restart reuses the stored credential without another
-// validation round-trip.
-func TestFullRemountResetsRootClearsCacheAndRestarts(t *testing.T) {
+// TestFullResetReturnsToFirstRunState pins the one-way reset: the runner is
+// stopped, the instance's VFS cache directory is really deleted, the reset
+// hook clears the durable credential, and the manager ends with no runner, no
+// cookie and first-run options — the wizard takes over from a fresh install's
+// position. No restart happens: remounting is the user's next move.
+func TestFullResetReturnsToFirstRunState(t *testing.T) {
 	h := newManagerHarness(t, MountOptions{Letter: "Q:", RootFID: "r1", RootPath: "/docs"})
 	if err := h.mgr.Start(context.Background(), "seed-cookie"); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -207,34 +212,27 @@ func TestFullRemountResetsRootClearsCacheAndRestarts(t *testing.T) {
 	}
 	h.lastRunner().cacheDir = cacheDir
 
-	if err := h.mgr.FullRemount(context.Background()); err != nil {
-		t.Fatalf("FullRemount: %v", err)
+	if err := h.mgr.FullReset(); err != nil {
+		t.Fatalf("FullReset: %v", err)
 	}
 
-	got := h.savedCfg[len(h.savedCfg)-1]
-	if got.RootFID != "0" || got.RootPath != "/" {
-		t.Errorf("saved root = %s/%s, want the whole drive 0//", got.RootFID, got.RootPath)
-	}
-	if got.Letter != "Q:" {
-		t.Errorf("saved letter = %q, want the choice preserved (Q:)", got.Letter)
+	if h.resets != 1 {
+		t.Errorf("reset hook calls = %d, want 1", h.resets)
 	}
 	if _, err := os.Stat(filepath.Join(cacheDir, "dirty.bin")); !os.IsNotExist(err) {
 		t.Errorf("cache file survived the reset: %v", err)
 	}
-	starts := len(h.started)
-	// m.cookie is the stored credential the manager was seeded with; the
-	// reset restarts from it without another validation round-trip.
-	if h.started[starts-1] != "seed-cookie" {
-		t.Errorf("restart cookie = %q, want the stored credential without revalidation", h.started[starts-1])
+	if len(h.started) != 1 {
+		t.Errorf("starts = %d, want 1: the reset must not remount by itself", len(h.started))
 	}
-	if h.mgr.optsSnapshot().RootFID != "0" {
-		t.Errorf("live opts root = %q, want 0", h.mgr.optsSnapshot().RootFID)
+	if got := h.mgr.Snapshot().State; got != supervisor.StateDisabled {
+		t.Errorf("Snapshot after reset = %s, want Disabled", got)
 	}
-
-	// Without a credential the reset refuses honestly.
-	h2 := newManagerHarness(t, MountOptions{})
-	if err := h2.mgr.FullRemount(context.Background()); err == nil {
-		t.Error("FullRemount without a credential must fail")
+	if h.mgr.Panel().HasCredential {
+		t.Error("panel still reports a credential after the reset")
+	}
+	if opts := h.mgr.CurrentOptions(); opts.RootFID != "" || opts.Letter != "" {
+		t.Errorf("options after reset = %+v, want first-run defaults", opts)
 	}
 }
 

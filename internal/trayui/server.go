@@ -79,7 +79,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/apply", s.guard(s.serveApply))
 	mux.HandleFunc("POST /api/reauth", s.guard(s.serveReauth))
 	mux.HandleFunc("POST /api/recheck", s.guard(s.serveRecheck))
-	mux.HandleFunc("POST /api/remount", s.guard(s.serveRemount))
+	mux.HandleFunc("POST /api/reset", s.guard(s.serveReset))
 	mux.HandleFunc("POST /api/autostart", s.guard(s.serveAutostart))
 	mux.HandleFunc("POST /api/upgrade", s.guard(s.serveUpgrade))
 	return mux
@@ -228,12 +228,12 @@ func (s *Server) serveRecheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true})
 }
 
-// serveRemount is the one-click reset: stop, clear the instance's VFS cache,
-// reset the root to the whole drive and restart from the stored credential.
-// The restart outlives the request, so its context is detached like apply's.
-func (s *Server) serveRemount(w http.ResponseWriter, r *http.Request) {
-	ctx := context.WithoutCancel(r.Context())
-	if err := s.mgr.FullRemount(ctx); err != nil {
+// serveReset is the one-way door back to the first-run state: stop the
+// mount, clear the instance's VFS cache, delete the stored credential and
+// the drive choices. The page asks for confirmation — dirty cache dies with
+// the cache directory.
+func (s *Server) serveReset(w http.ResponseWriter, r *http.Request) {
+	if err := s.mgr.FullReset(); err != nil {
 		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}

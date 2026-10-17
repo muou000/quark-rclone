@@ -108,6 +108,7 @@ func run() error {
 		startFunc(store, cfg, *port),
 		func(effective string) error { return store.SaveCookie(effective) },
 		saveConfigFunc(store),
+		resetFunc(store),
 		initialOptions(cfg),
 		hasCredential,
 		log,
@@ -272,6 +273,26 @@ func startFunc(store *profile.Store, cfg profile.Config, port int) func(context.
 			ProfileDir: store.Dir(),
 		})
 		return runnerAdapter{sup}, rec, nil
+	}
+}
+
+// resetFunc returns the durable stores to the first-run state: the stored
+// credential is deleted and the drive choices return to their defaults, so
+// the wizard starts clean. The shell-level autostart preference survives —
+// the HKCU Run key, not the profile, is its home (issue #25).
+func resetFunc(store *profile.Store) func() error {
+	return func() error {
+		if err := store.DeleteCookie(); err != nil {
+			return err
+		}
+		cfg, _, err := store.LoadConfig()
+		if err != nil {
+			cfg = profile.Default()
+		}
+		def := profile.Default()
+		cfg.Drive = def.Drive
+		cfg.Quark = def.Quark
+		return store.SaveConfig(cfg)
 	}
 }
 

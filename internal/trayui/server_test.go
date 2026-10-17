@@ -407,7 +407,7 @@ func TestPreflightWithoutHookAnswersHonestly(t *testing.T) {
 // supervisor killed every panel-applied mount the instant the page saw
 // "已应用，挂载重启中…" (observed on a real first-run: apply → Disabled in
 // the same second).
-func TestRemountIsGuardedAndResets(t *testing.T) {
+func TestResetIsGuardedAndReturnsToFirstRun(t *testing.T) {
 	h := newManagerHarness(t, MountOptions{Letter: "Q:", RootFID: "r1", RootPath: "/docs"})
 	if err := h.mgr.Start(context.Background(), "seed-cookie"); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -415,22 +415,24 @@ func TestRemountIsGuardedAndResets(t *testing.T) {
 	s := NewServer(h.mgr, "panel-token-123")
 
 	// Guarded like every mutation.
-	resp := postJSON(t, s.Handler(), "/api/remount", "", "")
+	resp := postJSON(t, s.Handler(), "/api/reset", "", "")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("unauthorized remount = %d, want 401", resp.StatusCode)
+		t.Fatalf("unauthorized reset = %d, want 401", resp.StatusCode)
 	}
 
-	// With the token the reset runs: root back to the whole drive.
-	resp = postJSON(t, s.Handler(), "/api/remount", "panel-token-123", "")
+	// With the token the reset runs and the panel reports first-run state.
+	resp = postJSON(t, s.Handler(), "/api/reset", "panel-token-123", "")
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if !strings.Contains(string(body), `"ok":true`) {
-		t.Fatalf("remount = %s", body)
+		t.Fatalf("reset = %s", body)
 	}
-	got := h.savedCfg[len(h.savedCfg)-1]
-	if got.RootFID != "0" || got.RootPath != "/" || got.Letter != "Q:" {
-		t.Errorf("remount saved = %+v, want root 0// with the letter kept", got)
+	if h.resets != 1 {
+		t.Errorf("reset hook calls = %d, want 1", h.resets)
+	}
+	if h.mgr.Panel().HasCredential {
+		t.Error("panel still reports a credential after the reset")
 	}
 }
 
