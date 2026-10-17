@@ -3,6 +3,8 @@ package trayui
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -186,6 +188,54 @@ func newManagerHarness(t *testing.T, opts MountOptions) *managerHarness {
 // lastRunner is the runner the most recent start returned.
 func (h *managerHarness) lastRunner() *fakeRunner {
 	return h.runners[len(h.runners)-1]
+}
+
+// TestFullRemountResetsRootClearsCacheAndRestarts pins the one-click reset:
+// the root returns to the whole drive with the letter preserved, the
+// instance's VFS cache directory is really deleted (only after the runner
+// stopped), and the restart reuses the stored credential without another
+// validation round-trip.
+func TestFullRemountResetsRootClearsCacheAndRestarts(t *testing.T) {
+	h := newManagerHarness(t, MountOptions{Letter: "Q:", RootFID: "r1", RootPath: "/docs"})
+	if err := h.mgr.Start(context.Background(), "seed-cookie"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	cacheDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cacheDir, "dirty.bin"), []byte("pending upload"), 0o600); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+	h.lastRunner().cacheDir = cacheDir
+
+	if err := h.mgr.FullRemount(context.Background()); err != nil {
+		t.Fatalf("FullRemount: %v", err)
+	}
+
+	got := h.savedCfg[len(h.savedCfg)-1]
+	if got.RootFID != "0" || got.RootPath != "/" {
+		t.Errorf("saved root = %s/%s, want the whole drive 0//", got.RootFID, got.RootPath)
+	}
+	if got.Letter != "Q:" {
+		t.Errorf("saved letter = %q, want the choice preserved (Q:)", got.Letter)
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, "dirty.bin")); !os.IsNotExist(err) {
+		t.Errorf("cache file survived the reset: %v", err)
+	}
+	starts := len(h.started)
+	// m.cookie is the stored credential the manager was seeded with; the
+	// reset restarts from it without another validation round-trip.
+	if h.started[starts-1] != "seed-cookie" {
+		t.Errorf("restart cookie = %q, want the stored credential without revalidation", h.started[starts-1])
+	}
+	if h.mgr.optsSnapshot().RootFID != "0" {
+		t.Errorf("live opts root = %q, want 0", h.mgr.optsSnapshot().RootFID)
+	}
+
+	// Without a credential the reset refuses honestly.
+	h2 := newManagerHarness(t, MountOptions{})
+	if err := h2.mgr.FullRemount(context.Background()); err == nil {
+		t.Error("FullRemount without a credential must fail")
+	}
 }
 
 func TestApplyValidationFailureTouchesNothing(t *testing.T) {

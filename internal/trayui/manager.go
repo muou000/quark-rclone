@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -348,6 +349,72 @@ func (m *Manager) Recheck(ctx context.Context) error {
 	}
 	m.log.Add("重新检查完成，挂载已重启")
 	return nil
+}
+
+// FullRemount is the one-click reset: stop the mount, delete this instance's
+// VFS cache directory — dirty files included, which is why the page confirms
+// first — put the root back to the whole drive, and restart from the stored
+// credential. The drive-letter choice stands; only the root resets. This is
+// the way back from "I mounted a sub-folder and the letter shows only that
+// folder".
+func (m *Manager) FullRemount(ctx context.Context) error {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+
+	if err := m.gate(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	cookie := m.cookie
+	opts := m.opts
+	runner := m.runner
+	var cacheDir string
+	if runner != nil {
+		cacheDir = runner.CacheDir()
+	}
+	m.mu.Unlock()
+	if strings.TrimSpace(cookie) == "" {
+		return errors.New("尚无已保存的凭据，请先在设置页完成配置")
+	}
+
+	// The root returns to the whole drive; the letter choice is preserved.
+	reset, err := MountOptions{Letter: opts.Letter, RootFID: "0", RootPath: "/"}.normalize()
+	if err != nil {
+		return err
+	}
+	if m.saveConfig != nil {
+		if err := m.saveConfig(reset); err != nil {
+			// Best-effort, exactly like the wizard's save: the restart below
+			// already runs with the reset options in memory.
+			m.log.Add("配置保存失败（重新挂载继续）：%v", err)
+		}
+	}
+
+	if runner != nil {
+		m.mu.Lock()
+		m.runner = nil
+		m.mu.Unlock()
+		runner.Stop()
+		// The cache may only be deleted once rclone is really gone: an open
+		// handle would make the removal partial.
+		select {
+		case <-runner.Done():
+		case <-time.After(10 * time.Second):
+			m.log.Add("等待挂载停止超时，仍尝试清空缓存")
+		}
+	}
+	if cacheDir != "" {
+		if err := os.RemoveAll(cacheDir); err != nil {
+			m.log.Add("缓存清空失败（不影响重新挂载）：%v", err)
+		} else {
+			m.log.Add("已清空实例缓存：%s", cacheDir)
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.opts = reset
+	return m.startLocked(ctx, cookie)
 }
 
 // stopRunner tears the current mount down, if any. Reports whether there was

@@ -163,6 +163,14 @@
       </div>
     </div>
     <div class="card">
+      <h2>完全重新挂载</h2>
+      <div class="muted" style="margin-bottom:8px">挂载的只是某个文件夹？用这个按钮恢复为整个网盘：停止挂载 → 清空本实例的 VFS 缓存（<b>含未回写成功的 dirty cache，其内容会丢失</b>）→ 根目录重置为整个网盘 → 重新挂载。盘符选择保持不变。</div>
+      <div class="row">
+        <button class="primary" id="btn-remount">清空缓存并完全重新挂载</button>
+        <span id="remount-msg" class="msg"></span>
+      </div>
+    </div>
+    <div class="card">
       <h2>开机自启动</h2>
       <div class="row">
         <input type="checkbox" id="autostart" style="width:auto">
@@ -338,6 +346,21 @@ $("btn-recheck").onclick = async () => {
     const j = await r.json();
     if (!j.ok) { msg.className = "msg err"; msg.textContent = j.error || "重启失败"; return; }
     msg.className = "msg ok"; msg.textContent = "挂载已重启";
+    panel();
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = "请求失败";
+  }
+};
+
+$("btn-remount").onclick = async () => {
+  if (!confirm("将停止挂载、清空缓存（未回写成功的文件会丢失），并把根目录重置为整个网盘后重新挂载。继续吗？")) return;
+  const msg = $("remount-msg");
+  msg.className = "msg"; msg.textContent = "正在停止挂载并清空缓存…";
+  try {
+    const r = await fetch("/api/remount", { method:"POST", headers:H });
+    const j = await r.json();
+    if (!j.ok) { msg.className = "msg err"; msg.textContent = j.error || "重新挂载失败"; return; }
+    msg.className = "msg ok"; msg.textContent = "已重置为整个网盘并重新挂载";
     panel();
   } catch (e) {
     msg.className = "msg err"; msg.textContent = "请求失败";
