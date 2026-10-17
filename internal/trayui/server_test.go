@@ -102,8 +102,8 @@ func TestValidateFlowAnswersWithoutEchoingCookie(t *testing.T) {
 	if err := json.Unmarshal(body, &out); err != nil {
 		t.Fatalf("validate response: %v (%s)", err, body)
 	}
-	if !out.OK || len(out.Dirs) != 1 || out.Dirs[0].FID != "d1" {
-		t.Fatalf("validate = %s", body)
+	if !out.OK || len(out.Dirs) != 2 || out.Dirs[0].FID != "0" || out.Dirs[0].Path != "/" || out.Dirs[1].FID != "d1" {
+		t.Fatalf("validate = %s, want the whole-drive option first, then the listed dirs", body)
 	}
 	if strings.Contains(string(body), "effective-cookie") {
 		t.Error("the effective cookie must never be echoed back to the page")

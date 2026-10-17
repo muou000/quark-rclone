@@ -154,6 +154,10 @@ type wizardRequest struct {
 	RootPath string `json:"root_path"`
 }
 
+// wholeDriveFID is Quark's root FID: the entry that mounts the entire drive
+// rather than one folder inside it.
+const wholeDriveFID = "0"
+
 // serveValidate runs the wizard's first step: validate the candidate and —
 // only on success — list the root directories for the choice step. The
 // effective cookie is deliberately not echoed back to the page.
@@ -174,11 +178,20 @@ func (s *Server) serveValidate(w http.ResponseWriter, r *http.Request) {
 	dirs, err := s.mgr.src.ListDirs(r.Context(), effective)
 	if err != nil {
 		// The login is good even if the listing failed; the wizard degrades
-		// to a free-form FID field instead of blocking.
-		writeJSON(w, map[string]any{"ok": true, "dirs": []RootDir{}, "list_error": redact.Error(err)})
+		// to the whole-drive choice instead of blocking.
+		writeJSON(w, map[string]any{"ok": true, "dirs": []RootDir{wholeDriveOption()}, "list_error": redact.Error(err)})
 		return
 	}
+	// The whole drive is always mountable: offer it first, so the default
+	// selection mounts everything rather than one folder inside it.
+	dirs = append([]RootDir{wholeDriveOption()}, dirs...)
 	writeJSON(w, map[string]any{"ok": true, "dirs": dirs})
+}
+
+// wholeDriveOption is the fixed first entry of the root choice: Quark's own
+// root, exposed as "/".
+func wholeDriveOption() RootDir {
+	return RootDir{FID: wholeDriveFID, Name: "", Path: "/"}
 }
 
 // serveApply runs the full first-run configuration: validate, persist

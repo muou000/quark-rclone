@@ -300,14 +300,11 @@ $("btn-validate").onclick = async () => {
   const sel = $("root-dir"); sel.innerHTML = "";
   (j.dirs || []).forEach(d0 => {
     const o = document.createElement("option");
-    o.value = d0.fid; o.textContent = d0.path; o.dataset.path = d0.path;
+    o.value = d0.fid;
+    o.textContent = d0.fid === "0" ? "/（整个网盘）" : d0.path;
+    o.dataset.path = d0.path;
     sel.appendChild(o);
   });
-  if (!(j.dirs || []).length) {
-    const o = document.createElement("option");
-    o.value = "0"; o.textContent = j.list_error ? "（列举失败，使用根目录：" + j.list_error + "）" : "（根目录）";
-    sel.appendChild(o);
-  }
   $("wizard-step2").style.display = "block";
 };
 
