@@ -25,7 +25,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -550,105 +549,69 @@ func runMount(ctx context.Context, args []string) error {
 		}
 	}
 
-	// Rotations during the session persist through the selected store: the
-	// DPAPI credential blob in profile mode, the plain file otherwise.
-	sess, err := supervisor.Start(ctx, supervisor.Config{
-		Port:    *port,
-		Cookie:  cookie,
-		RootFID: profileConfig.Quark.RootFID,
-		Persist: persist,
+	// The supervised lifecycle (issue #21) owns everything from here: the
+	// adapter endpoint, the rclone child, the drive letter, restarts and the
+	// shutdown order. The CLI subscribes to the state stream and waits.
+	statePath := ""
+	if profileStore != nil {
+		// Persist the lifecycle state beside the profile (ADR 0005).
+		statePath = filepath.Join(profileStore.Dir(), "state.json")
+	}
+	sup := supervisor.Supervise(ctx, supervisor.SupervisorConfig{
+		Port:           *port,
+		Cookie:         cookie,
+		Persist:        persist,
+		RootFID:        profileConfig.Quark.RootFID,
+		BundleDir:      bundleDirForGate,
+		RclonePath:     *rclone,
+		MountPoint:     *mountPoint,
+		CacheMode:      profileConfig.Writes.CacheMode,
+		WriteBack:      profileConfig.Writes.WriteBack,
+		WriteChunkSize: profileConfig.Writes.WriteChunkSize,
+		CacheDir:       profileConfig.CacheDir,
+		StatePath:      statePath,
 	})
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "endpoint: %s\n", sess.URL())
-	fmt.Fprintf(os.Stderr, "rclone config: %s\n", sess.ConfigPath())
-
-	// The rclone argument list carries the profile's write-back and cache
-	// settings so the profile actually drives the mount (issue #19), and the
-	// temporary session config supplies the credential.
-	rcloneArgs := func(configPath string) []string {
-		args := []string{"mount", "quark:", *mountPoint, "--config", configPath}
-		if profileConfig.Writes.CacheMode != "" {
-			args = append(args, "--vfs-cache-mode", profileConfig.Writes.CacheMode)
-		}
-		if profileConfig.Writes.WriteBack != "" {
-			args = append(args, "--vfs-write-back", profileConfig.Writes.WriteBack)
-		}
-		if profileConfig.Writes.WriteChunkSize != "" {
-			args = append(args, "--vfs-write-chunk-size", profileConfig.Writes.WriteChunkSize)
-		}
-		if profileConfig.CacheDir != "" {
-			args = append(args, "--cache-dir", profileConfig.CacheDir)
-		}
-		return args
-	}
-
-	var runner *exec.Cmd
-	rcloneStarted := time.Time{}
-	if *rclone != "" {
-		if *mountPoint == "" {
-			sess.Stop()
-			return errors.New("mount with -rclone requires -mount-point")
-		}
-		runner = exec.Command(*rclone, rcloneArgs(sess.ConfigPath())...)
-		runner.Stdout = os.Stdout
-		runner.Stderr = os.Stderr
-		if err := runner.Start(); err != nil {
-			sess.Stop()
-			return fmt.Errorf("start rclone: %w", err)
-		}
-		rcloneStarted = time.Now()
-	} else {
-		fmt.Fprintf(os.Stderr, "run: rclone %s\n", strings.Join(rcloneArgs("<config>"), " "))
-	}
-
-	rcloneDone := make(chan error, 1)
-	if runner != nil {
-		go func() { rcloneDone <- runner.Wait() }()
-	}
-	// teardown stops rclone (when running), records the drive letter the
-	// session actually held, drains the endpoint and deletes the temporary
-	// config. Every exit path below ends in it exactly once.
-	teardown := func() {
-		if runner != nil {
-			_ = runner.Process.Kill()
-			<-rcloneDone
-		}
-		if profileStore != nil && *mountPoint != "" && rcloneMounted(rcloneStarted) {
-			// Only a session that actually ran its mount records the letter:
-			// rclone exiting immediately with a taken letter never mounted,
-			// and recording it would make auto recovery retry the same
-			// conflict first (ADR 0005's last *actual* letter).
-			profileConfig.Drive.LastLetter = profile.NormalizeDriveLetter(*mountPoint)
-			if err := profileStore.SaveConfig(profileConfig); err != nil {
-				fmt.Fprintf(os.Stderr, "quark-adapter: could not save profile: %v\n", err)
+	states := sup.Subscribe()
+	printDone := make(chan struct{})
+	go func() {
+		defer close(printDone)
+		for {
+			select {
+			case st := <-states:
+				line := fmt.Sprintf("状态: %s（%s）", st.State, st.Phase)
+				if st.Err != "" {
+					line += " " + st.Err
+				}
+				if !st.NextRetry.IsZero() {
+					line += fmt.Sprintf(" 下次重试: %s", st.NextRetry.Format("15:04:05"))
+				}
+				fmt.Fprintln(os.Stderr, line)
+			case <-sup.Done():
+				return
 			}
 		}
-		sess.Stop()
+	}()
+	final := sup.Wait()
+	<-printDone
+
+	// The letter this session actually held is what the next auto recovery
+	// tries first (ADR 0005); only a session that reached Mounted records it.
+	if profileStore != nil && *mountPoint != "" && sup.ReachedMounted() {
+		profileConfig.Drive.LastLetter = profile.NormalizeDriveLetter(*mountPoint)
+		if err := profileStore.SaveConfig(profileConfig); err != nil {
+			fmt.Fprintf(os.Stderr, "quark-adapter: could not save profile: %v\n", err)
+		}
 	}
-	select {
-	case err := <-rcloneDone:
-		teardown()
-		return err
-	case err := <-sess.Done():
-		// The endpoint died under us; the mount session is over.
-		teardown()
-		return fmt.Errorf("endpoint stopped serving: %w", err)
-	case <-ctx.Done():
-		teardown()
+	switch final.State {
+	case supervisor.StateDisabled, supervisor.StateMounted:
 		fmt.Fprintln(os.Stderr, "mount session ended; temporary config deleted")
 		return nil
+	case supervisor.StateFailed:
+		return fmt.Errorf("挂载会话失败：%s %s", final.Phase, final.Err)
+	default:
+		// NeedsReauth / DriveConflict / WinFspRequired: the user must act.
+		return fmt.Errorf("挂载已暂停（%s）：%s", final.State, final.Err)
 	}
-}
-
-// rcloneMounted grace window: rclone that is still alive after this long has
-// mounted — an immediate non-zero exit (a taken drive letter, a bad flag)
-// never did, so its letter must not become the last-used record.
-const rcloneMountedGrace = 5 * time.Second
-
-func rcloneMounted(started time.Time) bool {
-	return !started.IsZero() && time.Since(started) >= rcloneMountedGrace
 }
 
 // profilePersist returns the rotation sink that stores refreshed cookies in
