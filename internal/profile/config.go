@@ -38,6 +38,16 @@ const (
 	DriveAuto DriveMode = "auto"
 )
 
+// NetworkMode names how the adapter reaches the provider.
+type NetworkMode string
+
+const (
+	// NetworkDirect connects without a proxy.
+	NetworkDirect NetworkMode = "direct"
+	// NetworkSystem follows the system proxy configuration.
+	NetworkSystem NetworkMode = "system"
+)
+
 // Config is the whole mount profile. Every field is non-sensitive: the
 // credential is stored separately through SaveCookie/LoadCookie and must
 // never be added here.
@@ -50,6 +60,13 @@ type Config struct {
 	CacheDir    string          `json:"cache_dir"`
 	Writes      WritesSettings  `json:"writes"`
 	Network     NetworkSettings `json:"network"`
+}
+
+// NetworkSettings records how the adapter should reach the provider.
+type NetworkSettings struct {
+	// Mode is direct or system (follow the system proxy). The adapter
+	// honours it when building its HTTP transport.
+	Mode NetworkMode `json:"mode"`
 }
 
 // DriveSettings records the drive-letter strategy and the last letter a mount
@@ -86,13 +103,6 @@ type WritesSettings struct {
 	WriteChunkSize string `json:"write_chunk_size"`
 }
 
-// NetworkSettings records how the adapter should reach the provider.
-type NetworkSettings struct {
-	// Mode is "direct" or "system" (follow the system proxy). The adapter
-	// honours it when building its HTTP transport.
-	Mode string `json:"mode"`
-}
-
 // Default returns the profile a fresh install starts from.
 func Default() Config {
 	return Config{
@@ -109,8 +119,26 @@ func Default() Config {
 			WriteBack:      "5s",
 			WriteChunkSize: "128Mi",
 		},
-		Network: NetworkSettings{Mode: "direct"},
+		Network: NetworkSettings{Mode: NetworkDirect},
 	}
+}
+
+// MountPoint is the mount point this profile asks for when the caller did
+// not name one: the explicit letter when pinned, otherwise the last letter a
+// session actually held (ADR 0005's auto recovery). Empty means the caller
+// must supply one.
+func (c Config) MountPoint() string {
+	switch c.Drive.Mode {
+	case DriveExplicit:
+		if c.Drive.ExplicitLetter != "" {
+			return c.Drive.ExplicitLetter + ":"
+		}
+	case DriveAuto:
+		if c.Drive.LastLetter != "" {
+			return c.Drive.LastLetter + ":"
+		}
+	}
+	return ""
 }
 
 // validate checks the invariants a stored profile must hold.
@@ -124,7 +152,7 @@ func (c Config) validate() error {
 		return fmt.Errorf("unknown drive mode %q", c.Drive.Mode)
 	}
 	switch c.Network.Mode {
-	case "direct", "system":
+	case NetworkDirect, NetworkSystem:
 	default:
 		return fmt.Errorf("unknown network mode %q", c.Network.Mode)
 	}

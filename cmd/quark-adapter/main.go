@@ -233,13 +233,9 @@ func runImport(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		persist = func(effective string) {
-			if err := st.SaveCookie(effective); err != nil {
-				fmt.Fprintf(os.Stderr, "quark-adapter: could not persist credential: %v\n", err)
-			}
-		}
+		persist = profilePersist(st)
 	} else {
-		persist = func(effective string) { writeCookieFile(*cookieFile, effective) }
+		persist = writeCookieFilePersist(*cookieFile)
 	}
 
 	store := session.NewStore("", persist)
@@ -401,52 +397,43 @@ func runMount(ctx context.Context, args []string) error {
 
 	var cookie string
 	var persist func(string)
-	var profStore *profile.Store
-	var prof profile.Config
+	var profileStore *profile.Store
+	var profileConfig profile.Config
 	switch {
 	case *useProfile:
 		st, err := openProfileStore(*profileDir)
 		if err != nil {
 			return err
 		}
-		profStore = st
+		profileStore = st
 		// A load failure here is the supervisor entering Failed (ADR 0005):
 		// the error already names the file and the remedy, and the original
 		// config is untouched on disk.
 		cfg, outcome, err := st.LoadConfig()
 		if err != nil {
+			fmt.Fprintln(os.Stderr, "state: failed")
 			return err
 		}
-		prof = cfg
+		profileConfig = cfg
 		fmt.Fprintf(os.Stderr, "profile: %s (%s)\n", st.ConfigPath(), outcome)
-		cookie, err = st.LoadCookie()
-		if err != nil {
-			return fmt.Errorf("load credential: %w (import -profile first)", err)
+		var err2 error
+		cookie, err2 = st.LoadCookie()
+		if err2 != nil {
+			return fmt.Errorf("load credential: %w (import -profile first)", err2)
 		}
-		persist = func(effective string) {
-			if err := st.SaveCookie(effective); err != nil {
-				fmt.Fprintf(os.Stderr, "quark-adapter: could not persist credential: %v\n", err)
-			}
-		}
+		persist = profilePersist(st)
 		// Auto recovery (ADR 0005): an unset mount point falls back to the
 		// recorded preference — the explicit letter, or the last letter a
 		// session actually held.
 		if *mountPoint == "" {
-			switch cfg.Drive.Mode {
-			case profile.DriveExplicit:
-				*mountPoint = cfg.Drive.ExplicitLetter + ":"
-			case profile.DriveAuto:
-				if cfg.Drive.LastLetter != "" {
-					*mountPoint = cfg.Drive.LastLetter + ":"
-				}
-			}
+			*mountPoint = cfg.MountPoint()
 		}
 	case *cookieFile != "":
 		var err error
 		if cookie, err = readCookieFile(*cookieFile); err != nil {
 			return err
 		}
-		persist = func(effective string) { writeCookieFile(*cookieFile, effective) }
+		persist = writeCookieFilePersist(*cookieFile)
 	default:
 		return errors.New("mount requires -profile or -cookie-file")
 	}
@@ -456,6 +443,7 @@ func runMount(ctx context.Context, args []string) error {
 	sess, err := supervisor.Start(ctx, supervisor.Config{
 		Port:    *port,
 		Cookie:  cookie,
+		RootFID: profileConfig.Quark.RootFID,
 		Persist: persist,
 	})
 	if err != nil {
@@ -464,21 +452,43 @@ func runMount(ctx context.Context, args []string) error {
 	fmt.Fprintf(os.Stderr, "endpoint: %s\n", sess.URL())
 	fmt.Fprintf(os.Stderr, "rclone config: %s\n", sess.ConfigPath())
 
+	// The rclone argument list carries the profile's write-back and cache
+	// settings so the profile actually drives the mount (issue #19), and the
+	// temporary session config supplies the credential.
+	rcloneArgs := func(configPath string) []string {
+		args := []string{"mount", "quark:", *mountPoint, "--config", configPath}
+		if profileConfig.Writes.CacheMode != "" {
+			args = append(args, "--vfs-cache-mode", profileConfig.Writes.CacheMode)
+		}
+		if profileConfig.Writes.WriteBack != "" {
+			args = append(args, "--vfs-write-back", profileConfig.Writes.WriteBack)
+		}
+		if profileConfig.Writes.WriteChunkSize != "" {
+			args = append(args, "--vfs-write-chunk-size", profileConfig.Writes.WriteChunkSize)
+		}
+		if profileConfig.CacheDir != "" {
+			args = append(args, "--cache-dir", profileConfig.CacheDir)
+		}
+		return args
+	}
+
 	var runner *exec.Cmd
+	rcloneStarted := time.Time{}
 	if *rclone != "" {
 		if *mountPoint == "" {
 			sess.Stop()
 			return errors.New("mount with -rclone requires -mount-point")
 		}
-		runner = exec.Command(*rclone, "mount", "quark:", *mountPoint, "--config", sess.ConfigPath())
+		runner = exec.Command(*rclone, rcloneArgs(sess.ConfigPath())...)
 		runner.Stdout = os.Stdout
 		runner.Stderr = os.Stderr
 		if err := runner.Start(); err != nil {
 			sess.Stop()
 			return fmt.Errorf("start rclone: %w", err)
 		}
+		rcloneStarted = time.Now()
 	} else {
-		fmt.Fprintf(os.Stderr, "run: rclone mount quark: <mount-point> --config %s\n", sess.ConfigPath())
+		fmt.Fprintf(os.Stderr, "run: rclone %s\n", strings.Join(rcloneArgs("<config>"), " "))
 	}
 
 	rcloneDone := make(chan error, 1)
@@ -493,13 +503,13 @@ func runMount(ctx context.Context, args []string) error {
 			_ = runner.Process.Kill()
 			<-rcloneDone
 		}
-		if profStore != nil && *mountPoint != "" {
-			// The letter this session held is what the next auto recovery
-			// tries first (ADR 0005). It is recorded even when the mount
-			// failed for another reason: the letter choice itself is still
-			// the most informative record.
-			prof.Drive.LastLetter = profile.NormalizeDriveLetter(*mountPoint)
-			if err := profStore.SaveConfig(prof); err != nil {
+		if profileStore != nil && *mountPoint != "" && rcloneMounted(rcloneStarted) {
+			// Only a session that actually ran its mount records the letter:
+			// rclone exiting immediately with a taken letter never mounted,
+			// and recording it would make auto recovery retry the same
+			// conflict first (ADR 0005's last *actual* letter).
+			profileConfig.Drive.LastLetter = profile.NormalizeDriveLetter(*mountPoint)
+			if err := profileStore.SaveConfig(profileConfig); err != nil {
 				fmt.Fprintf(os.Stderr, "quark-adapter: could not save profile: %v\n", err)
 			}
 		}
@@ -518,6 +528,30 @@ func runMount(ctx context.Context, args []string) error {
 		fmt.Fprintln(os.Stderr, "mount session ended; temporary config deleted")
 		return nil
 	}
+}
+
+// rcloneMounted grace window: rclone that is still alive after this long has
+// mounted — an immediate non-zero exit (a taken drive letter, a bad flag)
+// never did, so its letter must not become the last-used record.
+const rcloneMountedGrace = 5 * time.Second
+
+func rcloneMounted(started time.Time) bool {
+	return !started.IsZero() && time.Since(started) >= rcloneMountedGrace
+}
+
+// profilePersist returns the rotation sink that stores refreshed cookies in
+// the profile's DPAPI credential store (issue #19).
+func profilePersist(st *profile.Store) func(string) {
+	return func(effective string) {
+		if err := st.SaveCookie(effective); err != nil {
+			fmt.Fprintf(os.Stderr, "quark-adapter: could not persist credential: %v\n", err)
+		}
+	}
+}
+
+// writeCookieFilePersist returns the rotation sink for the plain cookie file.
+func writeCookieFilePersist(path string) func(string) {
+	return func(effective string) { writeCookieFile(path, effective) }
 }
 
 // readCookieFile loads the active cookie from disk.

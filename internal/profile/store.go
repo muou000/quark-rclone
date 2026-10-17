@@ -11,6 +11,11 @@ import (
 
 // Store is the mount profile's on-disk home: one directory holding
 // config.json and the credential blob.
+//
+// Distinct from session.Store (GLOSSARY: Session store): the session store
+// holds the live in-memory credential a running mount uses; a profile Store
+// owns the durable, on-disk state the supervisor reads before starting and
+// updates when a session ends.
 type Store struct {
 	dir string
 }
@@ -140,36 +145,39 @@ var migrations = map[int]func(json.RawMessage) (Config, error){
 }
 
 // migrateV0 upgrades a version-less profile to the current version. A v0
-// file has the same shape minus the version marker; the migration fills the
-// defaults for fields v0 did not carry and rejects values that no longer
-// name a legal choice.
+// file has the same shape minus the version marker; the migration carries
+// the user's choices over and fills the shared defaults for fields v0 did
+// not carry, then rejects values that no longer name a legal choice.
 func migrateV0(raw json.RawMessage) (Config, error) {
 	var v0 Config
 	if err := json.Unmarshal(raw, &v0); err != nil {
 		return Config{}, err
 	}
-	v0.Version = CurrentVersion
+	// The carried-over choices win; only the zero fields fall back to the
+	// defaults a fresh install would have had.
+	def := Default()
 	if v0.Quark.RootFID == "" {
-		v0.Quark.RootFID = "0"
+		v0.Quark.RootFID = def.Quark.RootFID
 	}
 	if v0.Quark.RootPath == "" {
-		v0.Quark.RootPath = "/"
+		v0.Quark.RootPath = def.Quark.RootPath
 	}
 	if v0.Writes.CacheMode == "" {
-		v0.Writes.CacheMode = "writes"
+		v0.Writes.CacheMode = def.Writes.CacheMode
 	}
 	if v0.Writes.WriteBack == "" {
-		v0.Writes.WriteBack = "5s"
+		v0.Writes.WriteBack = def.Writes.WriteBack
 	}
 	if v0.Writes.WriteChunkSize == "" {
-		v0.Writes.WriteChunkSize = "128Mi"
+		v0.Writes.WriteChunkSize = def.Writes.WriteChunkSize
 	}
 	if v0.Network.Mode == "" {
-		v0.Network.Mode = "direct"
+		v0.Network.Mode = def.Network.Mode
 	}
 	if v0.Drive.Mode == "" {
-		v0.Drive.Mode = DriveAuto
+		v0.Drive.Mode = def.Drive.Mode
 	}
+	v0.Version = CurrentVersion
 	if err := v0.validate(); err != nil {
 		return Config{}, err
 	}

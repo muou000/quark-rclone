@@ -322,6 +322,46 @@ func TestLoadCookieCorruptBlobDiagnoses(t *testing.T) {
 	}
 }
 
+// TestMountPointPinsTheAutoRecoveryPreference checks the profile's own
+// drive-letter strategy (ADR 0005): explicit wins when set, auto falls back
+// to the last actually-used letter, and nothing yields an empty string the
+// caller must fill.
+func TestMountPointPinsTheAutoRecoveryPreference(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{
+			name: "explicit letter",
+			cfg:  Config{Drive: DriveSettings{Mode: DriveExplicit, ExplicitLetter: "X"}},
+			want: "X:",
+		},
+		{
+			name: "explicit without letter",
+			cfg:  Config{Drive: DriveSettings{Mode: DriveExplicit}},
+			want: "",
+		},
+		{
+			name: "auto with last letter",
+			cfg:  Config{Drive: DriveSettings{Mode: DriveAuto, LastLetter: "Y"}},
+			want: "Y:",
+		},
+		{
+			name: "auto without history",
+			cfg:  Config{Drive: DriveSettings{Mode: DriveAuto}},
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.cfg.MountPoint(); got != tc.want {
+				t.Fatalf("MountPoint() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestNormalizeDriveLetter pins the mount-point → letter canonicalisation the
 // supervisor uses to update the last-used record.
 func TestNormalizeDriveLetter(t *testing.T) {
