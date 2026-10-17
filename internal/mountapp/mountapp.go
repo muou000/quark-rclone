@@ -34,12 +34,11 @@ type Options struct {
 
 	// rclone child and its write path (issue #23). CacheRoot is the base the
 	// supervisor derives the instance cache directory from.
-	CacheMode      string
-	WriteBack      string
-	WriteChunkSize string
-	CacheRoot      string
-	RclonePath     string
-	BundleDir      string
+	CacheMode  string
+	WriteBack  string
+	CacheRoot  string
+	RclonePath string
+	BundleDir  string
 
 	// Behaviour.
 	StatePath string
@@ -93,21 +92,20 @@ func Start(ctx context.Context, o Options) (*supervisor.Supervisor, *diag.Record
 	}
 
 	sup := supervisor.Supervise(ctx, supervisor.SupervisorConfig{
-		Port:           o.Port,
-		Cookie:         o.Cookie,
-		Persist:        o.Persist,
-		RootFID:        o.RootFID,
-		BundleDir:      o.BundleDir,
-		RclonePath:     o.RclonePath,
-		MountPoint:     o.MountPoint,
-		CacheMode:      o.CacheMode,
-		WriteBack:      o.WriteBack,
-		WriteChunkSize: o.WriteChunkSize,
-		CacheRoot:      o.CacheRoot,
-		StatePath:      o.StatePath,
-		ReadyProbe:     probeAPI.ProbeConfig,
-		Recorder:       rec,
-		ProbeCaps:      probeCaps,
+		Port:       o.Port,
+		Cookie:     o.Cookie,
+		Persist:    o.Persist,
+		RootFID:    o.RootFID,
+		BundleDir:  o.BundleDir,
+		RclonePath: o.RclonePath,
+		MountPoint: o.MountPoint,
+		CacheMode:  o.CacheMode,
+		WriteBack:  o.WriteBack,
+		CacheRoot:  o.CacheRoot,
+		StatePath:  o.StatePath,
+		ReadyProbe: probeAPI.ProbeConfig,
+		Recorder:   rec,
+		ProbeCaps:  probeCaps,
 	})
 	return sup, rec
 }

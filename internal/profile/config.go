@@ -93,14 +93,17 @@ type QuarkSettings struct {
 // WritesSettings carries the rclone write-back parameters for
 // vfs-cache-mode writes (ADR 0002/0005). Values are rclone duration and size
 // strings so they can be passed through verbatim.
+//
+// A write_chunk_size field once lived here and was removed: rclone has no
+// such flag, so it could never take effect. The drop needs no configuration
+// version bump — Go's JSON decode ignores the stale key in an existing
+// config.json, and nothing ever read it successfully anyway.
 type WritesSettings struct {
 	// CacheMode is the rclone --vfs-cache-mode value. The profile pins
 	// "writes" for the first release.
 	CacheMode string `json:"cache_mode"`
 	// WriteBack maps to --vfs-write-back, e.g. "5s".
 	WriteBack string `json:"write_back"`
-	// WriteChunkSize maps to --vfs-write-chunk-size, e.g. "128Mi".
-	WriteChunkSize string `json:"write_chunk_size"`
 }
 
 // Default returns the profile a fresh install starts from.
@@ -119,9 +122,8 @@ func Default() Config {
 		// and never deleted automatically.
 		CacheDir: "",
 		Writes: WritesSettings{
-			CacheMode:      "writes",
-			WriteBack:      "5s",
-			WriteChunkSize: "128Mi",
+			CacheMode: "writes",
+			WriteBack: "5s",
 		},
 		Network: NetworkSettings{Mode: NetworkDirect},
 	}

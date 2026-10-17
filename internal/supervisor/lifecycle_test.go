@@ -421,6 +421,45 @@ func TestRcloneExitTriggersRecoveringAndRestart(t *testing.T) {
 	}
 }
 
+// TestRcloneUsageErrorParksInFailed pins the deterministic-failure branch:
+// rclone rejecting its own command line (the --vfs-write-chunk-size
+// incident) parks in Failed instead of looping on the network schedule —
+// the same invocation would fail identically on every retry.
+func TestRcloneUsageErrorParksInFailed(t *testing.T) {
+	var mu sync.Mutex
+	launched := 0
+	var proc *fakeProcess
+	h := newHarness(t, func(c *SupervisorConfig) {
+		c.ProbeDrive = probeFalse
+		c.LaunchRclone = func(ctx context.Context, configPath string) (RcloneProcess, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			launched++
+			proc = newFakeProcess()
+			// Mirrors execProcess.Wait's rendering: the captured stderr, then
+			// the exit error.
+			proc.exit(errors.New(
+				"Error: unknown flag: --vfs-write-chunk-size\nUsage:\n  rclone mount remote:path /path/to/mountpoint [flags]: exit status 1"))
+			return proc, nil
+		}
+	})
+
+	await(t, h, StateFailed, 5*time.Second)
+	time.Sleep(20 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if launched != 1 {
+		t.Fatalf("launches = %d, want 1: a usage error is deterministic and must not retry", launched)
+	}
+	if !proc.wasKilled() {
+		t.Fatal("the rejected rclone was not torn down")
+	}
+	final := h.sup.Stop()
+	if final.State != StateDisabled {
+		t.Fatalf("final = %s, want Disabled", final.State)
+	}
+}
+
 // TestStopTimesOutWhenLetterWillNotDisappear checks the diagnosable shutdown
 // failure: a letter that stays visible past the shutdown timeout fails the
 // stop with an explicit remedy instead of pretending.
@@ -591,7 +630,6 @@ func TestCacheInstanceKeyIsStableAndSafe(t *testing.T) {
 func TestRcloneArgsPinWritesCacheDefaults(t *testing.T) {
 	h := newHarness(t, func(c *SupervisorConfig) {
 		c.WriteBack = "5s"
-		c.WriteChunkSize = "128Mi"
 	})
 	args := h.sup.rcloneArgs("cfg-path")
 	joined := strings.Join(args, " ")
@@ -599,7 +637,6 @@ func TestRcloneArgsPinWritesCacheDefaults(t *testing.T) {
 		"--vfs-cache-mode writes",
 		"--cache-dir " + h.sup.CacheDir(),
 		"--vfs-write-back 5s",
-		"--vfs-write-chunk-size 128Mi",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("rclone args missing %q: %s", want, joined)
