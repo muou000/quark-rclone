@@ -16,6 +16,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/muou000/quark-rclone/internal/adapter"
 	"github.com/muou000/quark-rclone/internal/dav"
+	"github.com/muou000/quark-rclone/internal/profile"
 	"github.com/muou000/quark-rclone/internal/quarkapi"
 	"github.com/muou000/quark-rclone/internal/quarkerr"
 	"github.com/muou000/quark-rclone/internal/redact"
@@ -60,11 +62,14 @@ commands:
   keepalive     run the periodic session refresh until interrupted
   serve         serve the loopback WebDAV endpoint until interrupted
   mount         run one mount session: endpoint + temporary rclone config
+  profile       print the mount profile and credential-store state
   capabilities  print the backend capability statement
 
 common flags:
   -cookie-file path   file holding the active cookie (import writes it)
   -port number        fixed loopback port for serve/mount (default 17385)
+  -profile            import/mount use the profile's DPAPI credential store
+  -profile-dir path   override the profile directory (diagnostics)
 `
 
 func main() {
@@ -189,6 +194,8 @@ func run(ctx context.Context, cmd string, args []string) error {
 		return runServe(ctx, args)
 	case "mount":
 		return runMount(ctx, args)
+	case "profile":
+		return runProfileShow(ctx, args)
 	case "capabilities":
 		caps := adapter.CapabilitiesOf()
 		fmt.Printf("copy:             %s\n", supportStr(caps.Copy))
@@ -200,15 +207,18 @@ func run(ctx context.Context, cmd string, args []string) error {
 }
 
 // runImport reads a candidate cookie from stdin, validates it, activates it
-// and writes the effective cookie to the cookie file.
+// and stores the effective cookie — either in the profile's DPAPI credential
+// store (-profile, issue #19) or in the plain cookie file.
 func runImport(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("import", flag.ContinueOnError)
-	cookieFile := fs.String("cookie-file", "", "file to write the effective cookie to (required)")
+	cookieFile := fs.String("cookie-file", "", "file to write the effective cookie to")
+	useProfile := fs.Bool("profile", false, "store the effective credential in the profile's DPAPI store")
+	profileDir := fs.String("profile-dir", "", "override the profile directory (diagnostics)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *cookieFile == "" {
-		return errors.New("import requires -cookie-file")
+	if !*useProfile && *cookieFile == "" {
+		return errors.New("import requires -cookie-file or -profile")
 	}
 
 	fmt.Fprintln(os.Stderr, "paste the browser-exported cookie, then press enter:")
@@ -217,15 +227,73 @@ func runImport(ctx context.Context, args []string) error {
 		return err
 	}
 
-	store := session.NewStore("", func(effective string) { writeCookieFile(*cookieFile, effective) })
+	var persist func(string)
+	if *useProfile {
+		st, err := openProfileStore(*profileDir)
+		if err != nil {
+			return err
+		}
+		persist = func(effective string) {
+			if err := st.SaveCookie(effective); err != nil {
+				fmt.Fprintf(os.Stderr, "quark-adapter: could not persist credential: %v\n", err)
+			}
+		}
+	} else {
+		persist = func(effective string) { writeCookieFile(*cookieFile, effective) }
+	}
+
+	store := session.NewStore("", persist)
 	svc := adapter.New(quarkapi.New(store, quarkapi.Config{}, nil), store)
 	if err := svc.ValidateAndActivate(ctx, candidate); err != nil {
-		// A rejected import must not create or clobber the cookie file, and
-		// the failure must be reported without echoing the candidate.
+		// A rejected import must not create or clobber the stored credential,
+		// and the failure must be reported without echoing the candidate.
 		return err
 	}
 	fmt.Fprintln(os.Stderr, "cookie validated and activated")
 	return nil
+}
+
+// runProfileShow prints the mount profile and the credential-store state
+// without ever printing the credential itself (issue #19). Load failures are
+// diagnostics, not silent exits: the message names the file and what to do.
+func runProfileShow(_ context.Context, args []string) error {
+	fs := flag.NewFlagSet("profile", flag.ContinueOnError)
+	profileDir := fs.String("profile-dir", "", "override the profile directory (diagnostics)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	st, err := openProfileStore(*profileDir)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "config: %s\n", st.ConfigPath())
+	fmt.Fprintf(os.Stderr, "credential: %s (DPAPI CurrentUser)\n", st.CredPath())
+
+	cfg, outcome, err := st.LoadConfig()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "outcome: %s\n", outcome)
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(data))
+	// Credential presence only: the value never reaches the output.
+	fmt.Fprintf(os.Stderr, "credential stored: %t\n", st.CookieExists())
+	return nil
+}
+
+// openProfileStore resolves the profile directory and opens the store.
+func openProfileStore(override string) (*profile.Store, error) {
+	dir := override
+	if dir == "" {
+		var err error
+		if dir, err = profile.DefaultDir(); err != nil {
+			return nil, err
+		}
+	}
+	return profile.Open(dir), nil
 }
 
 // withService wires the adapter from a cookie file and runs fn.
@@ -321,26 +389,74 @@ func runServe(ctx context.Context, args []string) error {
 // line (issue #18).
 func runMount(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mount", flag.ContinueOnError)
-	cookieFile := fs.String("cookie-file", "", "file holding the active cookie (required)")
+	cookieFile := fs.String("cookie-file", "", "file holding the active cookie (or use -profile)")
+	useProfile := fs.Bool("profile", false, "load the credential and drive settings from the mount profile (DPAPI, issue #19)")
+	profileDir := fs.String("profile-dir", "", "override the profile directory (diagnostics)")
 	port := fs.Int("port", defaultLoopbackPort, "fixed loopback port")
 	rclone := fs.String("rclone", "", "path to the rclone binary; empty prints the mount command instead of running it")
 	mountPoint := fs.String("mount-point", "", "drive letter or directory rclone mounts at")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *cookieFile == "" {
-		return errors.New("mount requires -cookie-file")
+
+	var cookie string
+	var persist func(string)
+	var profStore *profile.Store
+	var prof profile.Config
+	switch {
+	case *useProfile:
+		st, err := openProfileStore(*profileDir)
+		if err != nil {
+			return err
+		}
+		profStore = st
+		// A load failure here is the supervisor entering Failed (ADR 0005):
+		// the error already names the file and the remedy, and the original
+		// config is untouched on disk.
+		cfg, outcome, err := st.LoadConfig()
+		if err != nil {
+			return err
+		}
+		prof = cfg
+		fmt.Fprintf(os.Stderr, "profile: %s (%s)\n", st.ConfigPath(), outcome)
+		cookie, err = st.LoadCookie()
+		if err != nil {
+			return fmt.Errorf("load credential: %w (import -profile first)", err)
+		}
+		persist = func(effective string) {
+			if err := st.SaveCookie(effective); err != nil {
+				fmt.Fprintf(os.Stderr, "quark-adapter: could not persist credential: %v\n", err)
+			}
+		}
+		// Auto recovery (ADR 0005): an unset mount point falls back to the
+		// recorded preference — the explicit letter, or the last letter a
+		// session actually held.
+		if *mountPoint == "" {
+			switch cfg.Drive.Mode {
+			case profile.DriveExplicit:
+				*mountPoint = cfg.Drive.ExplicitLetter + ":"
+			case profile.DriveAuto:
+				if cfg.Drive.LastLetter != "" {
+					*mountPoint = cfg.Drive.LastLetter + ":"
+				}
+			}
+		}
+	case *cookieFile != "":
+		var err error
+		if cookie, err = readCookieFile(*cookieFile); err != nil {
+			return err
+		}
+		persist = func(effective string) { writeCookieFile(*cookieFile, effective) }
+	default:
+		return errors.New("mount requires -profile or -cookie-file")
 	}
-	cookie, err := readCookieFile(*cookieFile)
-	if err != nil {
-		return err
-	}
-	// Rotations during the session persist back to the cookie file, which is
-	// the supervisor's DPAPI persistence for now.
+
+	// Rotations during the session persist through the selected store: the
+	// DPAPI credential blob in profile mode, the plain file otherwise.
 	sess, err := supervisor.Start(ctx, supervisor.Config{
 		Port:    *port,
 		Cookie:  cookie,
-		Persist: func(effective string) { writeCookieFile(*cookieFile, effective) },
+		Persist: persist,
 	})
 	if err != nil {
 		return err
@@ -369,12 +485,23 @@ func runMount(ctx context.Context, args []string) error {
 	if runner != nil {
 		go func() { rcloneDone <- runner.Wait() }()
 	}
-	// teardown stops rclone (when running), drains the endpoint and deletes
-	// the temporary config. Every exit path below ends in it exactly once.
+	// teardown stops rclone (when running), records the drive letter the
+	// session actually held, drains the endpoint and deletes the temporary
+	// config. Every exit path below ends in it exactly once.
 	teardown := func() {
 		if runner != nil {
 			_ = runner.Process.Kill()
 			<-rcloneDone
+		}
+		if profStore != nil && *mountPoint != "" {
+			// The letter this session held is what the next auto recovery
+			// tries first (ADR 0005). It is recorded even when the mount
+			// failed for another reason: the letter choice itself is still
+			// the most informative record.
+			prof.Drive.LastLetter = profile.NormalizeDriveLetter(*mountPoint)
+			if err := profStore.SaveConfig(prof); err != nil {
+				fmt.Fprintf(os.Stderr, "quark-adapter: could not save profile: %v\n", err)
+			}
 		}
 		sess.Stop()
 	}
