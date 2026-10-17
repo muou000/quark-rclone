@@ -25,12 +25,14 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/muou000/quark-rclone/internal/adapter"
 	"github.com/muou000/quark-rclone/internal/dav"
+	"github.com/muou000/quark-rclone/internal/preflight"
 	"github.com/muou000/quark-rclone/internal/profile"
 	"github.com/muou000/quark-rclone/internal/quarkapi"
 	"github.com/muou000/quark-rclone/internal/quarkerr"
@@ -63,6 +65,7 @@ commands:
   serve         serve the loopback WebDAV endpoint until interrupted
   mount         run one mount session: endpoint + temporary rclone config
   profile       print the mount profile and credential-store state
+  doctor        run the WinFsp/rclone runtime pre-check (issue #20)
   capabilities  print the backend capability statement
 
 common flags:
@@ -70,6 +73,7 @@ common flags:
   -port number        fixed loopback port for serve/mount (default 17385)
   -profile            import/mount use the profile's DPAPI credential store
   -profile-dir path   override the profile directory (diagnostics)
+  -bundle-dir path    override the runtime bundle directory (doctor/mount)
 `
 
 func main() {
@@ -196,6 +200,8 @@ func run(ctx context.Context, cmd string, args []string) error {
 		return runMount(ctx, args)
 	case "profile":
 		return runProfileShow(ctx, args)
+	case "doctor":
+		return runDoctor(ctx, args)
 	case "capabilities":
 		caps := adapter.CapabilitiesOf()
 		fmt.Printf("copy:             %s\n", supportStr(caps.Copy))
@@ -204,6 +210,149 @@ func run(ctx context.Context, cmd string, args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", cmd)
 	}
+}
+
+// runDoctor runs the runtime pre-check (issue #20): platform, bundled
+// rclone, WinFsp, and — with -self-test and a credential source — one real
+// mount attempt. Failures print a Chinese remedy; nothing is ever repaired
+// silently. With -install-winfsp the bundled official installer starts after
+// the user's explicit confirmation, and the UAC prompt is the installer's
+// own.
+func runDoctor(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	bundleDir := fs.String("bundle-dir", "", "override the runtime bundle directory (default: <exe>\\bundle)")
+	installWinFsp := fs.Bool("install-winfsp", false, "explicitly confirm starting the bundled official WinFsp installer")
+	selfTest := fs.Bool("self-test", false, "run one real mount attempt after the static gates")
+	cookieFile := fs.String("cookie-file", "", "file holding the active cookie (with -self-test)")
+	useProfile := fs.Bool("profile", false, "load the credential from the profile's DPAPI store (with -self-test)")
+	profileDir := fs.String("profile-dir", "", "override the profile directory (diagnostics)")
+	port := fs.Int("port", defaultLoopbackPort, "fixed loopback port")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *installWinFsp {
+		dir := *bundleDir
+		if dir == "" {
+			dir = preflight.DefaultBundleDir()
+		}
+		if err := preflight.LaunchWinFspInstaller(dir, true); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	var selfTestFn func(ctx context.Context) error
+	if *selfTest {
+		st, err := buildSelfTest(ctx, *bundleDir, *cookieFile, *useProfile, *profileDir, *port)
+		if err != nil {
+			return err
+		}
+		selfTestFn = st
+	}
+
+	report := preflight.Run(ctx, preflight.Options{
+		BundleDir: *bundleDir,
+		SelfTest:  selfTestFn,
+	})
+	for _, f := range report.Findings {
+		mark := "通过"
+		if !f.OK {
+			mark = "未通过"
+		}
+		fmt.Printf("[%s] %s：%s\n", mark, f.Check, f.Detail)
+	}
+	fmt.Printf("预检结论：%s\n", report.Status)
+	if !report.OK() {
+		return fmt.Errorf("预检未通过（%s）", report.Status)
+	}
+	return nil
+}
+
+// buildSelfTest assembles one real mount attempt for the pre-check's
+// self-test gate: a session on the loopback endpoint plus the bundled rclone
+// mounting the probe letter. Its error text is what the classifier reads.
+func buildSelfTest(ctx context.Context, bundleDir, cookieFile string, useProfile bool, profileDir string, port int) (func(context.Context) error, error) {
+	var cookie string
+	var persist func(string)
+	switch {
+	case useProfile:
+		st, err := openProfileStore(profileDir)
+		if err != nil {
+			return nil, err
+		}
+		if cookie, err = st.LoadCookie(); err != nil {
+			return nil, fmt.Errorf("load credential: %w (import -profile first)", err)
+		}
+		persist = profilePersist(st)
+	case cookieFile != "":
+		var err error
+		if cookie, err = readCookieFile(cookieFile); err != nil {
+			return nil, err
+		}
+		persist = writeCookieFilePersist(cookieFile)
+	default:
+		return nil, errors.New("-self-test requires -profile or -cookie-file")
+	}
+
+	return func(testCtx context.Context) error {
+		sess, err := supervisor.Start(testCtx, supervisor.Config{Port: port, Cookie: cookie, Persist: persist})
+		if err != nil {
+			return err
+		}
+		defer sess.Stop()
+
+		rcloneExe := filepath.Join(bundleDir, "rclone.exe")
+		if _, err := os.Stat(rcloneExe); err != nil {
+			return fmt.Errorf("missing bundled rclone: %w", err)
+		}
+		// The probe letter is the profile's own preference, or Q: — a letter
+		// conflict here is part of what the self-test exists to classify.
+		probe := "Q:"
+		if st, err := openProfileStore(profileDir); err == nil {
+			if cfg, _, err := st.LoadConfig(); err == nil {
+				if mp := cfg.MountPoint(); mp != "" {
+					probe = mp
+				}
+			}
+		}
+		cmd := exec.Command(rcloneExe, "mount", "quark:", probe, "--config", sess.ConfigPath())
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+
+		// A mounted WebDAV drive is visible through the filesystem within a
+		// few seconds; a driver or letter problem shows up as an early exit.
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			if _, err := os.Stat(probe + `\`); err == nil {
+				_ = cmd.Process.Kill()
+				<-done
+				return nil
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					return errors.New(stderr.String())
+				}
+				return errors.New("rclone exited without mounting")
+			case <-testCtx.Done():
+				_ = cmd.Process.Kill()
+				return testCtx.Err()
+			default:
+			}
+			if time.Now().After(deadline) {
+				_ = cmd.Process.Kill()
+				<-done
+				return fmt.Errorf("mount did not appear within 30s: %s", stderr.String())
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	}, nil
 }
 
 // runImport reads a candidate cookie from stdin, validates it, activates it
@@ -391,6 +540,7 @@ func runMount(ctx context.Context, args []string) error {
 	port := fs.Int("port", defaultLoopbackPort, "fixed loopback port")
 	rclone := fs.String("rclone", "", "path to the rclone binary; empty prints the mount command instead of running it")
 	mountPoint := fs.String("mount-point", "", "drive letter or directory rclone mounts at")
+	bundleDir := fs.String("bundle-dir", "", "override the runtime bundle directory for the pre-check (default: <exe>\\bundle)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -436,6 +586,23 @@ func runMount(ctx context.Context, args []string) error {
 		persist = writeCookieFilePersist(*cookieFile)
 	default:
 		return errors.New("mount requires -profile or -cookie-file")
+	}
+
+	// Issue #20: the runtime pre-check gates every mount. A bundled rclone
+	// that fails its manifest, or a missing/mismatched WinFsp, blocks startup
+	// with a Chinese remedy — nothing is downloaded or repaired automatically.
+	bundleDirForGate := *bundleDir
+	if bundleDirForGate == "" {
+		bundleDirForGate = preflight.DefaultBundleDir()
+	}
+	if rc := preflight.CheckRclone(ctx, bundleDirForGate, nil); !rc.OK {
+		return errors.New(rc.Detail)
+	}
+	if wc := preflight.CheckWinFsp(); !wc.OK {
+		return errors.New(wc.Detail)
+	}
+	if *rclone != "" {
+		fmt.Fprintln(os.Stderr, "警告：-rclone 指定了非随包 rclone，该二进制未经 SHA-256 清单校验。")
 	}
 
 	// Rotations during the session persist through the selected store: the
