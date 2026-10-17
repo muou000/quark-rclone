@@ -125,3 +125,15 @@ _Avoid_: error log, upload queue, retry queue
 **Instance cache directory**:
 The VFS cache directory one mount instance owns exclusively, derived from the mount point and kept until the user cleans it.
 _Avoid_: shared cache, temp folder, cache directory (unqualified)
+
+**Main panel**:
+The tray's loopback web page carrying the status, diagnostics and setup views; the single surface for wizards and recovery flows.
+_Avoid_: dashboard, control panel, settings window
+
+**Recovery timeline**:
+The mount's state transitions rendered oldest-first in the diagnostics view, capped in memory.
+_Avoid_: event log, history list, audit trail
+
+**Panel token**:
+The per-process random value every state-changing panel request must present, isolating the mount from other local processes.
+_Avoid_: password, session id, API key

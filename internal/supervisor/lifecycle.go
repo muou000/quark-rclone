@@ -96,11 +96,18 @@ type Supervisor struct {
 	subs        map[chan Status]struct{}
 	final       Status
 	mountedSeen bool
+	// history is the transition timeline the diagnostics panel renders as the
+	// recovery view (issue #24); oldest first, capped at statusHistoryCap.
+	history []Status
 	// pauseReason remembers the paused state the lifecycle parked in, so the
 	// caller can tell "stopped cleanly" from "stopped because the user must
 	// act" even though both end at Disabled.
 	pauseReason State
 }
+
+// statusHistoryCap bounds the in-memory transition timeline. A flapping
+// network that cycles the lifecycle for days must not grow the process.
+const statusHistoryCap = 64
 
 // Supervise starts the lifecycle and returns immediately. The caller reads
 // Status/Subscribe for progress and calls Stop (or cancels the context) to
@@ -126,6 +133,15 @@ func (s *Supervisor) Status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.status
+}
+
+// History returns the transition timeline, oldest first, capped at the newest
+// statusHistoryCap entries (issue #24). It is what the tray's diagnostics
+// view renders as the recovery timeline.
+func (s *Supervisor) History() []Status {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Status(nil), s.history...)
 }
 
 // Subscribe receives every state transition from now on, starting with the
@@ -199,6 +215,10 @@ func (s *Supervisor) transition(state State, phase, errMsg string, nextRetry ...
 	}
 	s.mu.Lock()
 	s.status = st
+	s.history = append(s.history, st)
+	if len(s.history) > statusHistoryCap {
+		s.history = s.history[len(s.history)-statusHistoryCap:]
+	}
 	if state == StateMounted {
 		s.mountedSeen = true
 	}
@@ -569,6 +589,11 @@ func (s *Supervisor) CacheDir() string {
 	}
 	return filepath.Join(root, cacheInstanceKey(s.cfg.MountPoint))
 }
+
+// MountPoint reports the mount point this lifecycle was configured with —
+// the resolved letter, not the strategy. The tray's main panel shows it and
+// the letter recording on Mounted uses it (issue #24).
+func (s *Supervisor) MountPoint() string { return s.cfg.MountPoint }
 
 // ensureCacheDir creates the instance's cache directory before rclone starts.
 // Creating it here (rather than letting rclone) means a user-visible cache

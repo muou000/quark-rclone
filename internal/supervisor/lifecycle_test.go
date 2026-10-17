@@ -504,6 +504,44 @@ func TestStatusRedactsErrors(t *testing.T) {
 
 func probeFalse(mountPoint string) bool { return false }
 
+// TestHistoryRecordsTimelineAndCaps checks the recovery timeline (issue #24):
+// every transition lands oldest-first, and a flapping lifecycle cannot grow
+// the buffer past the cap.
+func TestHistoryRecordsTimelineAndCaps(t *testing.T) {
+	probe := &probeSeq{seq: []bool{false, true}, fallback: false}
+	h := newHarness(t, func(c *SupervisorConfig) {
+		c.ProbeDrive = probe.probe
+	})
+	await(t, h, StateMounted, 5*time.Second)
+
+	hist := h.sup.History()
+	if len(hist) < 3 {
+		t.Fatalf("history = %d entries, want the startup sequence", len(hist))
+	}
+	for i := 1; i < len(hist); i++ {
+		if hist[i].Since.Before(hist[i-1].Since) {
+			t.Fatalf("history not oldest-first at %d", i)
+		}
+	}
+	if hist[len(hist)-1].State != StateMounted {
+		t.Fatalf("last entry = %s, want Mounted", hist[len(hist)-1].State)
+	}
+
+	// Direct cap check on a bare supervisor: 70 transitions must keep the
+	// newest 64.
+	s := &Supervisor{subs: map[chan Status]struct{}{}}
+	for i := 0; i < statusHistoryCap+6; i++ {
+		s.transition(StateStarting, fmt.Sprintf("phase-%d", i), "")
+	}
+	capped := s.History()
+	if len(capped) != statusHistoryCap {
+		t.Fatalf("capped history = %d, want %d", len(capped), statusHistoryCap)
+	}
+	if capped[0].Phase != fmt.Sprintf("phase-%d", 6) || capped[len(capped)-1].Phase != fmt.Sprintf("phase-%d", statusHistoryCap+5) {
+		t.Fatalf("cap window wrong: first %q last %q", capped[0].Phase, capped[len(capped)-1].Phase)
+	}
+}
+
 // TestCacheInstanceKeyIsStableAndSafe pins the instance-key derivation (issue
 // #23, ADR 0011): a volume spelled differently lands in the same directory,
 // directory mount points get deterministic, mutually distinct keys, and no
