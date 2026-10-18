@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -746,6 +747,38 @@ func TestListProbesOnceWhenTotalIsExact(t *testing.T) {
 	}
 	if pagesAsked[4] {
 		t.Fatalf("pages asked = %v, want exactly one probe page", pagesAsked)
+	}
+}
+
+// TestListingCapClampsTheClaimedSize pins the policy that makes an absurd
+// `_total` harmless. The provider's total sizes the listing's initial
+// allocation, so the number is clamped on both ends: a negative claim (a
+// provider reporting -1, or a broken envelope) must not panic or underflow, and
+// an absurd claim must not allocate eight gigabytes of pointers for one page of
+// data.
+func TestListingCapClampsTheClaimedSize(t *testing.T) {
+	cases := []struct {
+		name  string
+		total int
+		want  int
+	}{
+		{"absent total is no preallocation", 0, 0},
+		{"a plausible total is honoured", 250, 250},
+		{"exactly the cap is honoured", listPreallocCap, listPreallocCap},
+		{"a negative claim floors to zero", -1, 0},
+		{"a wildly negative claim floors to zero", -1 << 40, 0},
+		{"one billion is clamped to the cap", 1 << 30, listPreallocCap},
+		{"an int-max claim is clamped", math.MaxInt, listPreallocCap},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := listingCap(tc.total); got != tc.want {
+				t.Fatalf("listingCap(%d) = %d, want %d", tc.total, got, tc.want)
+			}
+			if got := listingCap(tc.total); got < 0 {
+				t.Fatalf("listingCap(%d) = %d, want a non-negative capacity", tc.total, got)
+			}
+		})
 	}
 }
 

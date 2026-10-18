@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/muou000/quark-rclone/internal/quarkerr"
 )
@@ -86,22 +88,27 @@ func (c *Client) List(ctx context.Context, parentFID string) ([]*File, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make([]*File, 0, total)
+	// Preallocate from the reported total, but bounded: the provider's total is
+	// a hint that can over-report (and a broken one can be absurd), and a
+	// preallocation must never become a memory-amplification vector of its own.
+	out := make([]*File, 0, listingCap(total))
 	out = append(out, first...)
 
 	if total <= 0 {
 		// The provider reported no total. Keep the serial contract: fetch
 		// until a short page. Guessing a page count from the first page
 		// alone would either truncate the listing or over-fetch it.
-		for page := 2; len(first) == PageSize; page++ {
+		pageLen := len(first)
+		for page := 2; pageLen == PageSize; page++ {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			first, _, err = c.listPage(ctx, parentFID, page)
+			files, _, err := c.listPage(ctx, parentFID, page)
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, first...)
+			out = append(out, files...)
+			pageLen = len(files)
 		}
 		return out, nil
 	}
@@ -111,23 +118,25 @@ func (c *Client) List(ctx context.Context, parentFID string) ([]*File, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, files := range rest {
-		out = append(out, files...)
+	for _, r := range rest {
+		out = append(out, r.files...)
 	}
 
+	lastPage, lastLen := 1, len(first)
+	if n := len(rest); n > 0 {
+		lastPage, lastLen = rest[n-1].page, len(rest[n-1].files)
+	}
 	// A provider whose `_total` under-reports would truncate the listing here,
 	// and a truncated listing is indistinguishable from a folder that lost
-	// files. So the reported total is a hint, not a promise: when the last page
-	// fetched came back full, there may be more, and the listing is extended one
-	// page at a time until a short page proves the end. A folder whose size is
-	// not an exact multiple of the page size — the common case — pays nothing.
-	lastLen := len(first)
-	if len(rest) > 0 {
-		lastLen = len(rest[len(rest)-1])
-	}
+	// files. So the reported total is a hint, not a promise: while the last page
+	// of the fan-out came back full, more may exist, and the listing is extended
+	// one page at a time until one is short or empty, which proves the end. The
+	// empty-page rule matters just as much as the short one: a total that wildly
+	// over-reports would otherwise have the client ask for every page up to the
+	// number it made up.
 	for lastLen == PageSize {
-		pages++
-		files, _, err := c.listPage(ctx, parentFID, pages)
+		lastPage++
+		files, _, err := c.listPage(ctx, parentFID, lastPage)
 		if err != nil {
 			return nil, err
 		}
@@ -147,9 +156,14 @@ func (c *Client) List(ctx context.Context, parentFID string) ([]*File, error) {
 // a repeated entry silently overwrites its twin and the listing loses one of
 // them. Folding on the FID keeps the listing exactly as wide as the entries
 // actually observed.
+//
+// It returns a new slice rather than compacting in place: the input is the same
+// backing array the caller may still be holding (a page result, or the zero-total
+// loop's accumulator), and writing into it under the caller is a surprising side
+// effect for a function that reads like a query.
 func dedupeByFID(files []*File) []*File {
 	seen := make(map[string]struct{}, len(files))
-	out := files[:0]
+	out := make([]*File, 0, len(files))
 	for _, f := range files {
 		if _, dup := seen[f.FID]; dup {
 			continue
@@ -167,16 +181,60 @@ func dedupeByFID(files []*File) []*File {
 // the account.
 const listConcurrency = 8
 
+// listPreallocCap bounds the listing slice's initial capacity. The provider's
+// total is a hint that can over-report, and a preallocation sized by an
+// untrusted number turns a bogus total into a memory spike before a single
+// entry has been read. Growth past the cap is ordinary append amortisation.
+const listPreallocCap = 4096
+
+// listingCap is the initial capacity to allocate for a listing of a claimed
+// size. The claim comes straight from the provider, so it is clamped to zero at
+// the bottom and to listPreallocCap at the top before it is allowed to size an
+// allocation.
+func listingCap(claimed int) int {
+	if claimed < 0 {
+		return 0
+	}
+	if claimed > listPreallocCap {
+		return listPreallocCap
+	}
+	return claimed
+}
+
+// pageResult is one fetched listing page, tagged with the page number that
+// produced it. The tag is what lets the caller reassemble page order from a
+// fan-out that completes in an arbitrary order.
+type pageResult struct {
+	page  int
+	files []*File
+}
+
 // listPages fetches pages first..last (inclusive) with a bounded worker pool
-// and returns them in page order. A page that fails stops the remaining work
-// through the shared context, so a listing error does not leave a burst of
-// pointless requests running against the provider.
-func (c *Client) listPages(ctx context.Context, parentFID string, first, last int) ([][]*File, error) {
+// and returns them in page order.
+//
+// The page count the caller derived from `_total` is an upper bound, not a job
+// list: a response with an absurd total would otherwise have the pool try to
+// fetch a million pages and preallocate the results to match. So the feeder
+// publishes page numbers lazily, and a worker that finds a short or empty page
+// marks the listing as ended past that page — a provider that returns a partial
+// page has no entries beyond it, whatever the total claimed.
+//
+// A short page stops the feeder. It does NOT cancel the pool: the workers still
+// in flight hold results for pages below the end, and cancelling on a short page
+// would drop data that was already fetched. Only a genuine page failure cancels,
+// and even then the error is what the caller sees, so no partial listing can
+// emerge from a failed fetch.
+func (c *Client) listPages(ctx context.Context, parentFID string, first, last int) ([]pageResult, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	results := make([][]*File, last-first+1)
+	// lastPage is the highest page the listing can still contain. Lowered by the
+	// first worker that sees a short page: entries beyond it cannot exist.
+	var lastPage atomic.Int64
+	lastPage.Store(int64(last))
+
 	work := make(chan int)
+	done := make(chan pageResult, listConcurrency)
 	var (
 		wg       sync.WaitGroup
 		errOnce  sync.Once
@@ -188,7 +246,7 @@ func (c *Client) listPages(ctx context.Context, parentFID string, first, last in
 			cancel()
 		})
 	}
-	for range min(listConcurrency, len(results)) {
+	for range min(listConcurrency, max(last-first+1, 1)) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -198,29 +256,53 @@ func (c *Client) listPages(ctx context.Context, parentFID string, first, last in
 					fail(err)
 					return
 				}
-				results[page-first] = files
+				if len(files) < PageSize {
+					// A short or empty page is the end of the listing, so no
+					// page beyond it may be published.
+					for {
+						cur := lastPage.Load()
+						if int64(page) >= cur || lastPage.CompareAndSwap(cur, int64(page)) {
+							break
+						}
+					}
+				}
+				select {
+				case done <- pageResult{page: page, files: files}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}()
 	}
-	for page := first; page <= last; page++ {
-		select {
-		case work <- page:
-		case <-ctx.Done():
-			// A worker already failed, or the caller cancelled: stop
-			// feeding pages and let the pool drain.
-			close(work)
-			wg.Wait()
-			if firstErr != nil {
-				return nil, firstErr
+	go func() {
+		defer close(work)
+		for page := first; page <= last; page++ {
+			// Stop publishing past the page where the listing ended. The
+			// pages already in flight are allowed to finish: their results are
+			// data, and dropping them loses entries.
+			if int64(page) > lastPage.Load() {
+				return
 			}
-			return nil, ctx.Err()
+			select {
+			case work <- page:
+			case <-ctx.Done():
+				return
+			}
 		}
+	}()
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	results := make([]pageResult, 0, max(last-first+1, 0))
+	for r := range done {
+		results = append(results, r)
 	}
-	close(work)
-	wg.Wait()
 	if firstErr != nil {
 		return nil, firstErr
 	}
+	sort.Slice(results, func(i, j int) bool { return results[i].page < results[j].page })
 	return results, nil
 }
 
