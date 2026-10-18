@@ -693,6 +693,62 @@ func TestListSurfacesPageFailure(t *testing.T) {
 	}
 }
 
+// TestListProbesOnceWhenTotalIsExact pins the cost of trusting the total only
+// as a hint. A folder whose size is an exact multiple of the page size ends on
+// a full page, which is indistinguishable from an under-reported total, so the
+// listing costs exactly one extra (empty) request to prove the end. This test
+// exists so that cost stays visible: the alternative is silently truncating
+// exact-multiple folders, which is the bug this guards.
+func TestListProbesOnceWhenTotalIsExact(t *testing.T) {
+	const total = 2 * PageSize // two full pages, no short tail
+	var mu sync.Mutex
+	pagesAsked := map[int]bool{}
+	c, _ := newFakeAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/file/sort" {
+			http.NotFound(w, r)
+			return
+		}
+		page, err := strconv.Atoi(r.URL.Query().Get("_page"))
+		if err != nil {
+			t.Errorf("bad _page: %v", err)
+			return
+		}
+		mu.Lock()
+		pagesAsked[page] = true
+		mu.Unlock()
+		var list []map[string]any
+		if page <= 2 {
+			for i := range PageSize {
+				idx := (page-1)*PageSize + i
+				list = append(list, map[string]any{
+					"fid": fmt.Sprintf("fid-%04d", idx), "file_name": fmt.Sprintf("f%04d", idx), "file": true,
+				})
+			}
+		}
+		writeJSON(t, w, map[string]any{
+			"status": 200, "code": 0,
+			"data":     map[string]any{"list": list},
+			"metadata": map[string]any{"_total": total},
+		})
+	})
+
+	files, err := c.List(t.Context(), "root")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(files) != total {
+		t.Fatalf("got %d files, want %d", len(files), total)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !pagesAsked[3] {
+		t.Fatalf("pages asked = %v, want a page 3 probe to prove the listing ended", pagesAsked)
+	}
+	if pagesAsked[4] {
+		t.Fatalf("pages asked = %v, want exactly one probe page", pagesAsked)
+	}
+}
+
 // TestListStopsFanningOutOnCancellation checks a cancelled context aborts the
 // fan-out instead of letting the remaining page goroutines keep hammering the
 // provider after the mount gave up on the listing.
