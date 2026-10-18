@@ -644,6 +644,55 @@ func TestListKeepsGoingWhenTotalUnderReports(t *testing.T) {
 	}
 }
 
+// TestListSurfacesPageFailure pins the fan-out's error contract: when one page
+// fails, List returns that error instead of a partial listing. A partial
+// listing would look like a folder that lost entries — the exact confusion this
+// package exists to avoid — so the failure must win over the pages that did
+// arrive.
+func TestListSurfacesPageFailure(t *testing.T) {
+	c, _ := newFakeAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/file/sort" {
+			http.NotFound(w, r)
+			return
+		}
+		page, err := strconv.Atoi(r.URL.Query().Get("_page"))
+		if err != nil {
+			t.Errorf("bad _page: %v", err)
+			return
+		}
+		if page == 3 {
+			// One page of the fan-out is refused by the provider.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"status":500,"code":500,"message":"boom"}`))
+			return
+		}
+		list := make([]map[string]any, PageSize)
+		for i := range list {
+			idx := (page-1)*PageSize + i
+			list[i] = map[string]any{
+				"fid": fmt.Sprintf("fid-%04d", idx), "file_name": fmt.Sprintf("f%04d", idx), "file": true,
+			}
+		}
+		writeJSON(t, w, map[string]any{
+			"status": 200, "code": 0,
+			"data":     map[string]any{"list": list},
+			"metadata": map[string]any{"_total": 5 * PageSize},
+		})
+	})
+
+	files, err := c.List(t.Context(), "root")
+	if err == nil {
+		t.Fatalf("List returned %d files and no error; a failed page must not yield a partial listing", len(files))
+	}
+	if files != nil {
+		t.Fatalf("List returned files alongside an error: %d", len(files))
+	}
+	if !quarkerr.IsCategory(err, quarkerr.CatUpstreamTransient) {
+		t.Fatalf("category = %s, want upstream_transient", quarkerr.CategoryOf(err))
+	}
+}
+
 // TestListStopsFanningOutOnCancellation checks a cancelled context aborts the
 // fan-out instead of letting the remaining page goroutines keep hammering the
 // provider after the mount gave up on the listing.
