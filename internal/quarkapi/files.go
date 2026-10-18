@@ -7,6 +7,7 @@ import (
 	"html"
 	"net/http"
 	"strconv"
+	"sync"
 
 	"github.com/muou000/quark-rclone/internal/quarkerr"
 )
@@ -73,33 +74,173 @@ func (r *rawFile) toFile() *File {
 // List returns every entry in a directory, following pages until the provider
 // reports the total is exhausted. The FID is the only stable object identity:
 // names can change between pages and are never used to address an object.
+//
+// The first page lands serially because it is the one that reports the total,
+// and a single-page directory — the common case — must not pay for fan-out.
+// Every remaining page is then fetched by a bounded worker pool, so a folder
+// that spans N pages costs about one round-trip instead of N. The merge stays
+// in page order, so the listing is deterministic regardless of which worker
+// finishes first.
 func (c *Client) List(ctx context.Context, parentFID string) ([]*File, error) {
-	var out []*File
-	for page := 1; ; page++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		q := sortRequest{
-			PdirFID:           parentFID,
-			Page:              page,
-			FetchAllFile:      true,
-			FetchRiskFileName: true,
-		}
-		var resp sortResponse
-		if err := c.doQuery(ctx, EndpointFileSort, http.MethodGet, q.values(), nil, &resp); err != nil {
-			return nil, err
-		}
-		for i := range resp.Data.List {
-			out = append(out, resp.Data.List[i].toFile())
-		}
-		if resp.Metadata.Total > 0 {
-			if page*PageSize >= resp.Metadata.Total {
-				return out, nil
+	first, total, err := c.listPage(ctx, parentFID, 1)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*File, 0, total)
+	out = append(out, first...)
+
+	if total <= 0 {
+		// The provider reported no total. Keep the serial contract: fetch
+		// until a short page. Guessing a page count from the first page
+		// alone would either truncate the listing or over-fetch it.
+		for page := 2; len(first) == PageSize; page++ {
+			if err := ctx.Err(); err != nil {
+				return nil, err
 			}
-		} else if len(resp.Data.List) < PageSize {
-			return out, nil
+			first, _, err = c.listPage(ctx, parentFID, page)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, first...)
+		}
+		return out, nil
+	}
+
+	pages := (total + PageSize - 1) / PageSize
+	rest, err := c.listPages(ctx, parentFID, 2, pages)
+	if err != nil {
+		return nil, err
+	}
+	for _, files := range rest {
+		out = append(out, files...)
+	}
+
+	// A provider whose `_total` under-reports would truncate the listing here,
+	// and a truncated listing is indistinguishable from a folder that lost
+	// files. So the reported total is a hint, not a promise: when the last page
+	// fetched came back full, there may be more, and the listing is extended one
+	// page at a time until a short page proves the end. A folder whose size is
+	// not an exact multiple of the page size — the common case — pays nothing.
+	lastLen := len(first)
+	if len(rest) > 0 {
+		lastLen = len(rest[len(rest)-1])
+	}
+	for lastLen == PageSize {
+		pages++
+		files, _, err := c.listPage(ctx, parentFID, pages)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, files...)
+		lastLen = len(files)
+	}
+	return dedupeByFID(out), nil
+}
+
+// dedupeByFID folds repeated FIDs down to their first occurrence.
+//
+// The FID is the one stable identity the provider guarantees; a name is
+// display text that can repeat. Concurrent page fetches assume the provider's
+// ordering holds still between pages, and when it does not the same entry can
+// be served on two pages while another is skipped. A duplicate is harmless
+// here but poisonous downstream: the WebDAV layer keys a directory by name, so
+// a repeated entry silently overwrites its twin and the listing loses one of
+// them. Folding on the FID keeps the listing exactly as wide as the entries
+// actually observed.
+func dedupeByFID(files []*File) []*File {
+	seen := make(map[string]struct{}, len(files))
+	out := files[:0]
+	for _, f := range files {
+		if _, dup := seen[f.FID]; dup {
+			continue
+		}
+		seen[f.FID] = struct{}{}
+		out = append(out, f)
+	}
+	return out
+}
+
+// listConcurrency caps how many listing pages are in flight at once. Quark is
+// a reversed private API, so a polite ceiling beats maximum parallelism; eight
+// concurrent pages already turns a hundred-page folder's wall clock into a
+// handful of round-trips, and it bounds the pressure a single click puts on
+// the account.
+const listConcurrency = 8
+
+// listPages fetches pages first..last (inclusive) with a bounded worker pool
+// and returns them in page order. A page that fails stops the remaining work
+// through the shared context, so a listing error does not leave a burst of
+// pointless requests running against the provider.
+func (c *Client) listPages(ctx context.Context, parentFID string, first, last int) ([][]*File, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make([][]*File, last-first+1)
+	work := make(chan int)
+	var (
+		wg       sync.WaitGroup
+		errOnce  sync.Once
+		firstErr error
+	)
+	fail := func(err error) {
+		errOnce.Do(func() {
+			firstErr = err
+			cancel()
+		})
+	}
+	for range min(listConcurrency, len(results)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for page := range work {
+				files, _, err := c.listPage(ctx, parentFID, page)
+				if err != nil {
+					fail(err)
+					return
+				}
+				results[page-first] = files
+			}
+		}()
+	}
+	for page := first; page <= last; page++ {
+		select {
+		case work <- page:
+		case <-ctx.Done():
+			// A worker already failed, or the caller cancelled: stop
+			// feeding pages and let the pool drain.
+			close(work)
+			wg.Wait()
+			if firstErr != nil {
+				return nil, firstErr
+			}
+			return nil, ctx.Err()
 		}
 	}
+	close(work)
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return results, nil
+}
+
+// listPage fetches one listing page and reports the provider's total.
+func (c *Client) listPage(ctx context.Context, parentFID string, page int) ([]*File, int, error) {
+	q := sortRequest{
+		PdirFID:           parentFID,
+		Page:              page,
+		FetchAllFile:      true,
+		FetchRiskFileName: true,
+	}
+	var resp sortResponse
+	if err := c.doQuery(ctx, EndpointFileSort, http.MethodGet, q.values(), nil, &resp); err != nil {
+		return nil, 0, err
+	}
+	files := make([]*File, 0, len(resp.Data.List))
+	for i := range resp.Data.List {
+		files = append(files, resp.Data.List[i].toFile())
+	}
+	return files, resp.Metadata.Total, nil
 }
 
 // values renders the request as query parameters.
