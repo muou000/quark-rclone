@@ -619,6 +619,42 @@ func TestRcloneArgsPinWritesCacheDefaults(t *testing.T) {
 	}
 }
 
+// TestRcloneArgsPinListingLatencyParameters pins the pre-cache contract: a
+// revisited folder must open from the directory cache instead of paying a
+// provider round-trip, the whole tree must warm in the background right after
+// mount, and the on-disk file cache must be bounded so it cannot grow without
+// limit. These are mount-wide constants rather than profile fields: they are
+// the listing-latency defaults of this client, not a user preference.
+func TestRcloneArgsPinListingLatencyParameters(t *testing.T) {
+	h := newHarness(t, nil)
+	joined := strings.Join(h.sup.rcloneArgs("cfg-path"), " ")
+	for _, want := range []string{
+		"--dir-cache-time 30m",
+		"--vfs-refresh",
+		"--vfs-cache-max-size 1G",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("rclone args missing %q: %s", want, joined)
+		}
+	}
+
+	// The flags are pairs where they take a value, so rclone parses them as
+	// written rather than swallowing the next argument.
+	args := h.sup.rcloneArgs("cfg-path")
+	for i, a := range args {
+		switch a {
+		case "--dir-cache-time":
+			if i+1 >= len(args) || args[i+1] != "30m" {
+				t.Fatalf("--dir-cache-time must be followed by its value: %v", args)
+			}
+		case "--vfs-cache-max-size":
+			if i+1 >= len(args) || args[i+1] != "1G" {
+				t.Fatalf("--vfs-cache-max-size must be followed by its value: %v", args)
+			}
+		}
+	}
+}
+
 // TestCacheDirCreatedBeforeLaunchAndSurvivesStop is the dirty-cache recovery
 // contract: the instance directory exists before rclone starts and is never
 // deleted by the supervisor — dirty cache left behind must be there for the

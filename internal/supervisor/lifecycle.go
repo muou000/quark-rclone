@@ -553,12 +553,30 @@ func (s *Supervisor) launchRclone(ctx context.Context, configPath string) (Rclon
 // otherwise, and the cache directory is this instance's own — derived from
 // the mount point, stable across restarts so dirty cache resumes, and never
 // deleted by the supervisor.
+//
+// The listing-latency flags answer the "click a folder and wait" complaint:
+//
+//   - --dir-cache-time 30m keeps a folder's listing in memory for half an
+//     hour, so a revisited folder opens from cache instead of a round-trip.
+//     This is the same knob ADR 0002 leaves at the rclone default of 5m; a
+//     mount whose tree rarely changes can afford the longer window, and a
+//     write through the mount still invalidates its own directories.
+//   - --vfs-refresh walks the whole tree in the background once the mount is
+//     up. It is memory-only (the directory cache, never the data cache), it
+//     runs after the mount is usable so it never blocks a first click, and
+//     rclone paces the walk itself, so it does not become a request storm.
+//   - --vfs-cache-max-size 1G bounds the on-disk file cache. Dirty files are
+//     exempt from eviction (rclone never drops unwritten data), so the cap
+//     bounds clean cache only — ADR 0002's data-safety rule still holds.
 func (s *Supervisor) rcloneArgs(configPath string) []string {
 	args := []string{
 		"mount", "quark:", s.cfg.MountPoint,
 		"--config", configPath,
 		"--vfs-cache-mode", s.cacheMode(),
 		"--cache-dir", s.CacheDir(),
+		"--dir-cache-time", dirCacheTime,
+		"--vfs-refresh",
+		"--vfs-cache-max-size", fileCacheMaxSize,
 	}
 	if s.cfg.WriteBack != "" {
 		args = append(args, "--vfs-write-back", s.cfg.WriteBack)
@@ -568,6 +586,19 @@ func (s *Supervisor) rcloneArgs(configPath string) []string {
 	}
 	return args
 }
+
+// The listing-latency constants of the mount. They are not profile fields:
+// they describe how this client wants rclone to behave, not a choice the user
+// makes, and every mount of the drive wants the same values.
+const (
+	// dirCacheTime is how long rclone considers a directory listing current.
+	// Long enough that browsing back into a folder is free, short enough that
+	// an out-of-band provider change still surfaces within one sitting.
+	dirCacheTime = "30m"
+	// fileCacheMaxSize caps the clean on-disk VFS cache. Dirty files are
+	// exempt, so this never trades data safety for disk space.
+	fileCacheMaxSize = "1G"
+)
 
 // cacheMode is the VFS cache mode this mount runs with. ADR 0002/0005 pin
 // "writes" for the Windows common write path; an explicit profile value is

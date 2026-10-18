@@ -1,10 +1,13 @@
 package quarkapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -437,7 +440,7 @@ func TestListFollowsPages(t *testing.T) {
 		if r.URL.Query().Get("_page") == "1" {
 			list := make([]map[string]any, PageSize)
 			for i := range list {
-				list[i] = map[string]any{"fid": "f", "file_name": "n", "file": true, "size": 1}
+				list[i] = map[string]any{"fid": fmt.Sprintf("fid-%03d", i), "file_name": fmt.Sprintf("n%03d", i), "file": true, "size": 1}
 			}
 			writeJSON(t, w, map[string]any{
 				"status": 200, "code": 0,
@@ -462,6 +465,208 @@ func TestListFollowsPages(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("page calls = %d, want 2", calls)
+	}
+}
+
+// TestListFansOutAndKeepsPageOrder pins the parallel-pagination contract: the
+// first page lands alone (it decides whether more pages exist), the remaining
+// pages are fetched concurrently, and the merged listing stays in page order
+// so the result is deterministic regardless of completion order.
+func TestListFansOutAndKeepsPageOrder(t *testing.T) {
+	const total = 3*PageSize + 17 // four pages; the last one is short
+	var mu sync.Mutex
+	inFlight, peak := 0, 0
+	c, _ := newFakeAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/file/sort" {
+			http.NotFound(w, r)
+			return
+		}
+		page, err := strconv.Atoi(r.URL.Query().Get("_page"))
+		if err != nil {
+			t.Errorf("bad _page: %v", err)
+			return
+		}
+		mu.Lock()
+		inFlight++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		mu.Unlock()
+		defer func() {
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+		}()
+		// Hold every page long enough for the fan-out to overlap, so the
+		// peak-concurrency assertion below observes the real shape rather
+		// than a lucky scheduling order.
+		time.Sleep(20 * time.Millisecond)
+
+		count := PageSize
+		if n := total - (page-1)*PageSize; n < count {
+			count = n
+		}
+		list := make([]map[string]any, count)
+		for i := range list {
+			idx := (page-1)*PageSize + i
+			list[i] = map[string]any{
+				"fid": fmt.Sprintf("fid-%04d", idx), "file_name": fmt.Sprintf("f%04d", idx), "file": true,
+			}
+		}
+		writeJSON(t, w, map[string]any{
+			"status": 200, "code": 0,
+			"data":     map[string]any{"list": list},
+			"metadata": map[string]any{"_total": total},
+		})
+	})
+
+	files, err := c.List(t.Context(), "root")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(files) != total {
+		t.Fatalf("got %d files, want %d", len(files), total)
+	}
+	for i, f := range files {
+		if want := fmt.Sprintf("f%04d", i); f.Name != want {
+			t.Fatalf("files[%d].Name = %q, want %q: page order not preserved", i, f.Name, want)
+		}
+	}
+	if peak < 2 {
+		t.Fatalf("peak concurrent page fetches = %d, want the pages beyond the first to overlap", peak)
+	}
+}
+
+// TestListDeduplicatesAcrossPages covers the failure mode concurrency makes
+// reachable: if the provider's ordering shifts between page requests, the same
+// FID can land on two pages while another entry is skipped. The FID is the
+// stable identity, so a duplicate is folded to its first occurrence rather
+// than handed to the WebDAV layer twice, where the name-keyed directory map
+// would silently drop one of them.
+func TestListDeduplicatesAcrossPages(t *testing.T) {
+	const total = 2 * PageSize
+	c, _ := newFakeAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/file/sort" {
+			http.NotFound(w, r)
+			return
+		}
+		page, err := strconv.Atoi(r.URL.Query().Get("_page"))
+		if err != nil {
+			t.Errorf("bad _page: %v", err)
+			return
+		}
+		var list []map[string]any
+		switch page {
+		case 1:
+			for i := range PageSize {
+				list = append(list, map[string]any{
+					"fid": fmt.Sprintf("fid-%04d", i), "file_name": fmt.Sprintf("f%04d", i), "file": true,
+				})
+			}
+		case 2:
+			// Page 2 re-serves the last entry of page 1, as an unstable
+			// sort would, and fills the rest with new entries.
+			list = append(list, map[string]any{
+				"fid": fmt.Sprintf("fid-%04d", PageSize-1), "file_name": fmt.Sprintf("f%04d", PageSize-1), "file": true,
+			})
+			for i := PageSize; i < total; i++ {
+				list = append(list, map[string]any{
+					"fid": fmt.Sprintf("fid-%04d", i), "file_name": fmt.Sprintf("f%04d", i), "file": true,
+				})
+			}
+		default:
+			t.Errorf("unexpected page %d", page)
+		}
+		writeJSON(t, w, map[string]any{
+			"status": 200, "code": 0,
+			"data":     map[string]any{"list": list},
+			"metadata": map[string]any{"_total": total},
+		})
+	})
+
+	files, err := c.List(t.Context(), "root")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(files) != total {
+		t.Fatalf("got %d files, want %d: the re-served FID must be folded, not duplicated", len(files), total)
+	}
+	seen := make(map[string]bool, len(files))
+	for _, f := range files {
+		if seen[f.FID] {
+			t.Fatalf("fid %s appeared twice in the listing", f.FID)
+		}
+		seen[f.FID] = true
+	}
+}
+
+// TestListKeepsGoingWhenTotalUnderReports covers a provider whose `_total` is
+// smaller than the pages it actually serves. Fanning out from the reported
+// total would then truncate the listing at exactly the wrong place — and a
+// truncated listing is indistinguishable from a folder that lost files. When
+// the last planned page still comes back full, one more page is fetched to
+// prove the listing really ended.
+func TestListKeepsGoingWhenTotalUnderReports(t *testing.T) {
+	const realTotal = 2 * PageSize // two full pages exist
+	c, _ := newFakeAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/file/sort" {
+			http.NotFound(w, r)
+			return
+		}
+		page, err := strconv.Atoi(r.URL.Query().Get("_page"))
+		if err != nil {
+			t.Errorf("bad _page: %v", err)
+			return
+		}
+		var list []map[string]any
+		if page <= 2 {
+			for i := range PageSize {
+				idx := (page-1)*PageSize + i
+				list = append(list, map[string]any{
+					"fid": fmt.Sprintf("fid-%04d", idx), "file_name": fmt.Sprintf("f%04d", idx), "file": true,
+				})
+			}
+		}
+		writeJSON(t, w, map[string]any{
+			"status": 200, "code": 0,
+			"data": map[string]any{"list": list},
+			// The provider claims one page while serving two.
+			"metadata": map[string]any{"_total": PageSize},
+		})
+	})
+
+	files, err := c.List(t.Context(), "root")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(files) != realTotal {
+		t.Fatalf("got %d files, want %d: an under-reported total must not truncate", len(files), realTotal)
+	}
+}
+
+// TestListStopsFanningOutOnCancellation checks a cancelled context aborts the
+// fan-out instead of letting the remaining page goroutines keep hammering the
+// provider after the mount gave up on the listing.
+func TestListStopsFanningOutOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c, _ := newFakeAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/file/sort" {
+			http.NotFound(w, r)
+			return
+		}
+		// The first page reports a large total, then cancels: every later
+		// page must observe the cancelled context rather than call out.
+		cancel()
+		writeJSON(t, w, map[string]any{
+			"status": 200, "code": 0,
+			"data":     map[string]any{"list": []map[string]any{{"fid": "f", "file_name": "n", "file": true}}},
+			"metadata": map[string]any{"_total": 1000},
+		})
+	})
+
+	if _, err := c.List(ctx, "root"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("List error = %v, want context.Canceled", err)
 	}
 }
 
